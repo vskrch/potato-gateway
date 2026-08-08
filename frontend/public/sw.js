@@ -1,7 +1,9 @@
-const CACHE_NAME = 'potato-dashboard-v1'
+const CACHE_NAME = 'potato-dashboard-v2'
 // ponytail: only pre-cache the entrypoint. Hashed assets are cached at runtime
 // on first load, so the shell works offline without hard-coding build hashes.
-const SHELL_ASSETS = ['/', '/index.html', '/manifest.json', '/icon-192.png', '/icon-512.png']
+// /dashboard (not /) is the SPA shell — / serves the JSON discovery doc to
+// non-browser Accept headers, which cache.addAll would otherwise store.
+const SHELL_ASSETS = ['/dashboard', '/index.html', '/manifest.json', '/icon-192.png', '/icon-512.png']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

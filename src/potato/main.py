@@ -674,6 +674,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/manifest.json")
     @app.get("/sw.js")
+    @app.get("/index.html")
     @app.get("/icon-192.png")
     @app.get("/icon-512.png")
     @app.get("/maskable-192.png")
@@ -683,8 +684,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/maskable-192.svg")
     @app.get("/maskable-512.svg")
     async def serve_static_root_file(request: Request) -> Any:
-        """Serve root PWA manifest, service worker, and icon assets."""
+        """Serve root PWA manifest, service worker, and icon assets.
+
+        ``/index.html`` is served here too so the service worker's
+        ``cache.addAll`` install step succeeds (the shell must exist at the
+        canonical PWA start URL). ``sw.js`` is never cached so browser
+        service-worker update checks always see the latest bytes.
+        """
         filename = request.url.path.lstrip("/")
+        if filename == "sw.js":
+            file_path = Path(__file__).parent / "static" / "dist" / "sw.js"
+            if file_path.is_file():
+                from fastapi.responses import FileResponse
+
+                return FileResponse(
+                    file_path,
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+                )
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        if filename == "index.html":
+            return _dashboard_html()
         file_path = Path(__file__).parent / "static" / "dist" / filename
         if file_path.is_file():
             from fastapi.responses import FileResponse
