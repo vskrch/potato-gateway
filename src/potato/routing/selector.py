@@ -89,8 +89,9 @@ class ModelSelector:
             rl_score, _, _ = self.rl_engine.score(mid, feature_vector)
             # Multiplicative boost bounded in [0.5, 2.0] so baseline capability is preserved
             boost = max(0.5, min(2.0, 1.0 + rl_score))
-            # Preserve base candidate order position via subtle tie-breaker
-            position_weight = 1.0 / (1.0 + 0.05 * idx)
+            # Preserve base candidate order via subtle tie-breaker (anti-
+            # celebrity: keep the prior weak so RL can actually reorder)
+            position_weight = 1.0 / (1.0 + 0.01 * idx)
             composite = boost * position_weight
             scored.append((composite, mid))
 

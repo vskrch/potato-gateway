@@ -284,6 +284,12 @@ class Settings(BaseSettings):
     default_affinity: float = 0.85
     thompson_scale: float = 16.0
     thompson_blend_n: int = 12
+    # Anti-celebrity exploration (NMK-RL): guarantee one under-sampled live
+    # model a seat near the chain head on auto requests so the bandit can
+    # discover challengers instead of locking in the ladder leader forever.
+    # The slot is quality-gated (never explore far below the proven head).
+    rl_exploration_enabled: bool = True
+    rl_exploration_min_quality_ratio: float = 0.5
 
     # Dynamic Intelligence Scoring (NMK-I / NMK-S / NMK-G8)
     artificial_analysis_api_key: str = ""

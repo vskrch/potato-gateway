@@ -984,7 +984,6 @@ async def test_upstream_invalid_json_advances(
             {},
             _key(1),
         )
-
     upstream = AsyncMock()
     upstream.request_json = fake_json
     decision = RouteDecision(
@@ -1000,3 +999,108 @@ async def test_upstream_invalid_json_advances(
     assert result.status_code == 200
     assert result.model == "model-b"
     assert calls == ["model-a", "model-b"]
+
+
+# ── Anti-celebrity exploration slot (NMK-RL) ─────────────────────────
+
+
+def _seed_exploration_fixture(
+    settings: Settings,
+    *,
+    scores: dict[str, float] | None = None,
+) -> tuple[ModelRegistry, FallbackExecutor]:
+    """Registry with a well-sampled head pair and one under-sampled challenger.
+
+    ``scores`` optionally fakes ladder scores (quality gate tests).
+    """
+    from types import SimpleNamespace
+
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-c", "model-b"}
+    # Celebrities: heavily sampled. Challenger: zero samples.
+    for _ in range(20):
+        reg.learning.record(intent="coding_agentic", model_id="model-a", success=True)
+        reg.learning.record(intent="coding_agentic", model_id="model-c", success=True)
+    reg.health.record_outcome("model-a", success=True, latency=0.1, tokens=100)
+    reg.health.record_outcome("model-c", success=True, latency=0.2, tokens=100)
+    if scores is not None:
+        reg.ladder._ladders = {
+            ("coding_agentic", "default"): SimpleNamespace(scores=dict(scores))
+        }
+    ex = FallbackExecutor(AsyncMock(), reg, settings)
+    ex._provider_available = lambda _m: True
+    return reg, ex
+
+
+def _coding_auto_decision() -> RouteDecision:
+    return RouteDecision(
+        chain=["model-a", "model-c", "model-b"],
+        mode="auto",
+        intent=Intent.CODING_AGENTIC,
+        rule_id="test",
+        requested_model="auto",
+    )
+
+
+def test_chain_injects_exploration_slot_for_undersampled_model() -> None:
+    """An under-sampled challenger is promoted to second place on auto
+    requests so the bandit actually samples it (anti-celebrity)."""
+    settings = Settings(
+        nim_api_keys=["k"],
+        max_model_fallbacks=5,
+        ucb_exploration_c=5.0,
+        thompson_blend_n=12,
+    )
+    _reg, ex = _seed_exploration_fixture(settings)
+    chain = ex._chain(_coding_auto_decision())
+    assert chain[1] == "model-b", chain
+
+
+def test_chain_skips_exploration_slot_when_quality_below_gate() -> None:
+    """Exploration is quality-gated: a challenger far below the head is not
+    promoted (retaining model quality during exploration)."""
+    settings = Settings(nim_api_keys=["k"], max_model_fallbacks=5)
+    _reg, ex = _seed_exploration_fixture(
+        settings, scores={"model-a": 100, "model-c": 90, "model-b": 40}
+    )
+    chain = ex._chain(_coding_auto_decision())
+    # model-b (40 < 0.5 * 100) must not be promoted over model-c (90).
+    assert "model-b" not in chain[:2], chain
+
+
+def test_chain_injects_exploration_slot_when_quality_passes_gate() -> None:
+    """A challenger within the quality gate is promoted even when ladder
+    scores exist."""
+    settings = Settings(nim_api_keys=["k"], max_model_fallbacks=5)
+    _reg, ex = _seed_exploration_fixture(
+        settings, scores={"model-a": 100, "model-c": 90, "model-b": 80}
+    )
+    chain = ex._chain(_coding_auto_decision())
+    assert chain[1] == "model-b", chain
+
+
+def test_chain_skips_exploration_slot_when_disabled() -> None:
+    """rl_exploration_enabled=False disables the slot entirely."""
+    settings = Settings(
+        nim_api_keys=["k"],
+        max_model_fallbacks=5,
+        rl_exploration_enabled=False,
+    )
+    _reg, ex = _seed_exploration_fixture(settings)
+    chain = ex._chain(_coding_auto_decision())
+    assert chain[1] != "model-b"
+
+
+def test_chain_skips_exploration_slot_for_explicit_request() -> None:
+    """Explicit (non-auto) requests never get exploration substitution."""
+    settings = Settings(nim_api_keys=["k"], max_model_fallbacks=5)
+    _reg, ex = _seed_exploration_fixture(settings)
+    decision = RouteDecision(
+        chain=["model-a", "model-c", "model-b"],
+        mode="passthrough_with_fallback",
+        intent=Intent.CODING_AGENTIC,
+        rule_id="test",
+        requested_model="model-a",
+    )
+    chain = ex._chain(decision)
+    assert chain[1] != "model-b"

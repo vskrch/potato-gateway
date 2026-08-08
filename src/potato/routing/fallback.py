@@ -527,6 +527,72 @@ class FallbackExecutor:
             )
         return available
 
+    def _best_exploration_candidate(
+        self,
+        current: list[str],
+        *,
+        intent: str,
+        allowed_models: list[str],
+        free_only: bool,
+    ) -> str | None:
+        """Highest-UCB under-sampled live model not already leading the chain.
+
+        Anti-celebrity exploration: models with few samples get the largest
+        UCB1 bonus, so a challenger that the ladder head has starved finally
+        gets sampled. Quality gate: the candidate must score >=
+        ``rl_exploration_min_quality_ratio`` × the best current candidate —
+        exploration never serves a model far below the proven head.
+        """
+        import math
+
+        registry = self.registry
+        try:
+            ladder = getattr(registry, "ladder", None)
+            snap = getattr(ladder, "_ladders", {}).get((intent, "default"))
+            scores = snap.scores if snap is not None else {}
+        except Exception:
+            scores = {}
+        top_score = max((scores.get(m, 0.0) for m in current), default=0.0)
+        min_ratio = float(
+            getattr(self.settings, "rl_exploration_min_quality_ratio", 0.5) or 0.5
+        )
+        floor = top_score * min_ratio if top_score > 0 else None
+
+        from potato.routing.auto_router import filter_chain
+
+        candidates = list(getattr(registry, "active_live_ids", lambda: set())() or set())
+        candidates = [m for m in candidates if self._provider_available(m)]
+        candidates = [m for m in candidates if m not in current[:2]]
+        if allowed_models or free_only:
+            candidates = filter_chain(
+                candidates, allowed_models=allowed_models or None, free_only=free_only
+            )
+        if floor is not None:
+            candidates = [m for m in candidates if scores.get(m, 0.0) >= floor]
+
+        total_n = registry.learning.total_requests(intent)
+        blend_n = int(getattr(self.settings, "thompson_blend_n", 12) or 12)
+        c = float(getattr(self.settings, "ucb_exploration_c", 5.0) or 5.0)
+        best: str | None = None
+        best_ucb = -1.0
+        best_quality = -1.0
+        for m in candidates:
+            n = registry.learning.model_requests(intent, m)
+            if n >= blend_n:
+                continue  # already sufficiently sampled — not a challenger
+            if total_n < 2:
+                ucb = c * 2.0
+            elif n == 0:
+                ucb = c * math.sqrt(math.log(total_n + 1))
+            else:
+                ucb = c * math.sqrt(math.log(total_n + 1) / n)
+            quality = scores.get(m, 0.0)
+            if ucb > best_ucb or (ucb == best_ucb and quality > best_quality):
+                best_ucb = ucb
+                best_quality = quality
+                best = m
+        return best
+
     async def _try_models(
         self,
         models: list[str],
@@ -1001,7 +1067,7 @@ class FallbackExecutor:
                     for idx, mid in enumerate(tail):
                         rl_score, _, _ = self.rl_engine.score(mid, rl_x)
                         boost = max(0.5, min(2.0, 1.0 + rl_score))
-                        position_weight = 1.0 / (1.0 + 0.05 * idx)
+                        position_weight = 1.0 / (1.0 + 0.01 * idx)
                         scored.append((boost * position_weight, mid))
                     scored.sort(key=lambda t: t[0], reverse=True)
                     available = [pinned] + [m for _, m in scored]
@@ -1010,7 +1076,7 @@ class FallbackExecutor:
                     for idx, mid in enumerate(available):
                         rl_score, _, _ = self.rl_engine.score(mid, rl_x)
                         boost = max(0.5, min(2.0, 1.0 + rl_score))
-                        position_weight = 1.0 / (1.0 + 0.05 * idx)
+                        position_weight = 1.0 / (1.0 + 0.01 * idx)
                         scored.append((boost * position_weight, mid))
                     scored.sort(key=lambda t: t[0], reverse=True)
                     available = [m for _, m in scored]
@@ -1081,6 +1147,32 @@ class FallbackExecutor:
             from potato.routing.auto_router import filter_chain
 
             available = filter_chain(available, allowed_models=allowed or None, free_only=free_only)
+        # Anti-celebrity exploration slot: on auto decisions, promote one
+        # under-sampled live model (highest UCB) to second place so the bandit
+        # actually samples challengers instead of locking in the ladder
+        # leader. Quality-gated so exploration never serves a model far
+        # below the proven head; constraint filters already applied above.
+        if (
+            is_auto
+            and len(available) > 1
+            and getattr(self.settings, "rl_exploration_enabled", True)
+        ):
+            try:
+                challenger = self._best_exploration_candidate(
+                    available,
+                    intent=intent,
+                    allowed_models=allowed,
+                    free_only=free_only,
+                )
+                if challenger:
+                    if challenger in available[:2]:
+                        challenger = None  # already leading — no slot needed
+                    else:
+                        # Move (not duplicate) the challenger to second place.
+                        available = [m for m in available if m != challenger]
+                        available.insert(1, challenger)
+            except Exception:
+                logger.debug("exploration slot selection failed", exc_info=True)
         chain = available[: max(1, max_n)]
         # Final auto guarantee
         if not chain and is_auto:
