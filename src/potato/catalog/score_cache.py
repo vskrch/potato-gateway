@@ -89,6 +89,11 @@ def _compute_quality(bundle: IntelBundle | None, slug: str, yaml_cfg: dict) -> f
         if bundle.arena_elo is not None:
             elo_norm = min(100.0, max(0.0, (bundle.arena_elo - arena_base) / arena_scale))
             signals.append((elo_norm, w_elo))
+        if w_par > 0 and bundle.param_b is not None and bundle.param_b > 0:
+            # Param-size signal (same log-scale formula as the slug fallback,
+            # clamped so unknown-param models never exceed known SOTA).
+            p = float(bundle.param_b)
+            signals.append((min(84.0, max(50.0, 58.0 + 6.0 * math.log2(p / 7.0))), w_par))
 
     if signals:
         total_w = sum(w for _, w in signals)

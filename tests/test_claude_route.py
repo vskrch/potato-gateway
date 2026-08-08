@@ -37,7 +37,9 @@ def test_transform_anthropic_to_openai():
         "tool_choice": {"type": "any"},
     }
     openai_payload = transform_anthropic_to_openai(anthropic_payload)
-    assert openai_payload["model"] == "potato/auto"
+    # Claude Code requests are intentionally routed through the coding intent
+    # chain (potato/auto-coding) — see routes/claude.py.
+    assert openai_payload["model"] == "potato/auto-coding"
     assert openai_payload["max_tokens"] == 500
     assert openai_payload["tool_choice"] == "required"
     assert openai_payload["temperature"] == 0.5
