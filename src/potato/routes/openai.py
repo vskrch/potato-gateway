@@ -1161,6 +1161,26 @@ async def _chat_like(
             error=str(exc),
             timing=timing,
         )
+        if stream:
+            from potato.compat import frame_sse_error
+
+            async def _err_iter_rt():
+                yield frame_sse_error(
+                    str(exc) or "Upstream pool exhausted.",
+                    code="potato_pool_exhausted",
+                    status=503,
+                )
+
+            return StreamingResponse(
+                _err_iter_rt(),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "X-Request-Id": req_id,
+                },
+            )
         return JSONResponse(content=guard.pool_exhausted_error(), status_code=503)
     except Exception as exc:
         await guard.after_request(ctx, success=False)
@@ -1175,6 +1195,28 @@ async def _chat_like(
             timing=timing,
         )
         logger.exception("chat path failed req=%s", req_id)
+        if stream:
+            from potato.compat import frame_sse_error
+
+            async def _err_iter_ex():
+                yield frame_sse_error(
+                    "Upstream request failed — please retry.",
+                    code="potato_internal_error",
+                    status=503,
+                    retry_after="5",
+                )
+
+            return StreamingResponse(
+                _err_iter_ex(),
+                status_code=200,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "Retry-After": "5",
+                    "X-Request-Id": req_id,
+                },
+            )
         return JSONResponse(
             content=openai_error(
                 "Upstream request failed — please retry.",

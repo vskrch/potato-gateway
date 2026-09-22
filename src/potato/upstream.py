@@ -147,15 +147,33 @@ class UpstreamClient:
         forward_headers: dict[str, str] | None = None,
         max_retries: int = 3,
         preferred_key_id: str | None = None,
+        acquire_timeout: float | None = None,
     ) -> tuple[int, Any, dict[str, str], KeyStats]:
         """
         Non-streaming request with key rotation + retry on 429.
         Returns (status_code, body_json_or_text, response_headers, key).
+
+        acquire_timeout bounds the key-acquire wait separately from the HTTP
+        timeout so pool-exhaustion surfaces as KeyPoolExhausted (capacity)
+        instead of being misread as a transport stall downstream.
         """
         last_error: BaseException | None = None
         for attempt in range(max_retries):
             try:
-                key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+                if acquire_timeout is not None:
+                    try:
+                        key = await asyncio.wait_for(
+                            self.pool.acquire(preferred_key_id=preferred_key_id),
+                            timeout=max(0.05, acquire_timeout),
+                        )
+                    except TimeoutError as exc:
+                        raise KeyPoolExhausted(
+                            f"key acquire timed out after {acquire_timeout:.1f}s (capacity)"
+                        ) from exc
+                else:
+                    key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+            except KeyPoolExhausted:
+                raise
             except RuntimeError as exc:
                 raise KeyPoolExhausted(str(exc)) from exc
             released = False
@@ -258,15 +276,32 @@ class UpstreamClient:
         forward_headers: dict[str, str] | None = None,
         max_retries: int = 3,
         preferred_key_id: str | None = None,
+        acquire_timeout: float | None = None,
     ) -> tuple[int, AsyncIterator[bytes], dict[str, str], KeyStats]:
         """
         Open a streaming response. Caller must consume the iterator fully
         so the key is released (wrapper handles release on completion/error).
+
+        acquire_timeout bounds the key-acquire wait separately from the HTTP
+        timeout (see request_json).
         """
         last_error: BaseException | None = None
         for attempt in range(max_retries):
             try:
-                key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+                if acquire_timeout is not None:
+                    try:
+                        key = await asyncio.wait_for(
+                            self.pool.acquire(preferred_key_id=preferred_key_id),
+                            timeout=max(0.05, acquire_timeout),
+                        )
+                    except TimeoutError as exc:
+                        raise KeyPoolExhausted(
+                            f"key acquire timed out after {acquire_timeout:.1f}s (capacity)"
+                        ) from exc
+                else:
+                    key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+            except KeyPoolExhausted:
+                raise
             except RuntimeError as exc:
                 raise KeyPoolExhausted(str(exc)) from exc
             released = False

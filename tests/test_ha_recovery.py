@@ -50,7 +50,7 @@ def _hub_stub(cb: ProviderCircuitBreaker, clients: dict[str, object]) -> SimpleN
         return clients[model_id], pid, model_id
 
     return SimpleNamespace(
-        provider_ids=set(clients.keys()) and {"nim", "p1", "p2"},
+        provider_ids={"nim", "p1", "p2"},
         circuit_breaker=cb,
         client_for_model=client_for_model,
         has_runtime=lambda pid: True,
@@ -452,3 +452,299 @@ async def test_generator_close_releases_key_inflight() -> None:
     assert first
     await it.aclose()
     assert key.in_flight == 0
+
+
+# ── T11: parallel hedge serves the fast secondary on primary stall (P2-1) ──
+
+
+@pytest.mark.asyncio
+async def test_parallel_hedge_secondary_wins_on_stall() -> None:
+    import asyncio as _aio
+
+    settings = Settings(
+        nim_api_keys=["k"],
+        max_model_fallbacks=5,
+        request_deadline_seconds=60.0,
+        retry_backoff_base_seconds=0.0,
+        retry_backoff_cap_seconds=0.0,
+        enable_parallel_hedge=True,
+        parallel_hedge_delay_seconds=0.05,
+    )
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-b"}
+
+    async def fake_stream(method, path, **kwargs):
+        model = (kwargs.get("json_body") or {}).get("model", "")
+
+        async def slow():
+            await _aio.sleep(5.0)
+            yield b"data: late\n\n"
+
+        async def fast():
+            yield b'data: {"choices": [{"delta": {"content": "hedged"}}]}\n\n'
+
+        if model == "model-a":
+            return 200, slow(), {"content-type": "text/event-stream"}, _key()
+        return 200, fast(), {"content-type": "text/event-stream"}, _key(1)
+
+    upstream = AsyncMock()
+    upstream.stream = fake_stream
+    ex = FallbackExecutor(upstream, reg, settings)
+    ex._provider_available = lambda _m: True  # type: ignore[method-assign]
+    ex._client_for = lambda m: (upstream, m)  # type: ignore[method-assign]
+    # Provider-diverse pair so the hedge is eligible.
+    ex._provider_id_for = lambda m: {"model-a": "p1", "model-b": "p2"}[m]  # type: ignore[method-assign]
+
+    result = await ex.execute_stream(
+        "/chat/completions", {"messages": []}, _auto(["model-a", "model-b"])
+    )
+    assert result.status_code == 200
+    assert result.model == "model-b"
+    assert ex.stats.hedge_attempts == 1
+    assert ex.stats.hedge_wins == 1
+    body = b"".join([chunk async for chunk in result.byte_iter])
+    assert b"hedged" in body
+
+
+# ── T12: recovery pool never crashes on empty chains (review critical) ──
+
+
+def test_recovery_pool_empty_chain_no_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(nim_api_keys=["k"])
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = set()
+    ex = FallbackExecutor(AsyncMock(), reg, settings)
+    monkeypatch.setattr(ex, "_chain", lambda d, had_tools=False: [])
+    monkeypatch.setattr(ex, "_heal_empty_chain", lambda *a, **k: [])
+    import potato.resilience as _res
+
+    monkeypatch.setattr(_res, "emergency_chain", lambda *a, **k: [])
+    fresh, chain_retry = ex._recovery_pool(
+        _auto([]), had_tools=False, tried=set(), allow_any_live=False
+    )
+    assert fresh == []
+    assert chain_retry == []
+
+
+# ── T13: key-acquire wait surfaces as capacity, fast (review high) ──
+
+
+@pytest.mark.asyncio
+async def test_acquire_timeout_surfaces_capacity() -> None:
+    import time as _time
+
+    from potato.upstream import KeyPoolExhausted, UpstreamClient
+
+    pool = KeyPool(api_keys=["k"])
+    pool._keys[0].cooldown_until = _time.monotonic() + 60.0
+    client = UpstreamClient(base_url="http://localhost:1", pool=pool)
+    t0 = _time.monotonic()
+    with pytest.raises(KeyPoolExhausted):
+        await client.request_json("POST", "/chat/completions", acquire_timeout=0.2)
+    assert _time.monotonic() - t0 < 5.0
+
+
+# ── T14: generic RuntimeError in execute_json advances to next fallback candidate (RCA) ──
+
+
+@pytest.mark.asyncio
+async def test_generic_runtime_error_advances_fallback() -> None:
+    """RCA: upstream errors wrapped in RuntimeError('upstream failed after retries: ...')
+    must advance through fallback chain rather than raising fatal exception to openai.py.
+    """
+    settings = Settings(
+        nim_api_keys=["k"],
+        max_model_fallbacks=3,
+        request_deadline_seconds=30.0,
+        retry_backoff_base_seconds=0.0,
+        retry_backoff_cap_seconds=0.0,
+    )
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-b"}
+
+    calls: list[str] = []
+
+    async def fake_json(method, path, **kwargs):
+        model = (kwargs.get("json_body") or {}).get("model", "")
+        calls.append(model)
+        if model == "model-a":
+            # UpstreamClient wraps httpx.ReadTimeout in RuntimeError:
+            raise RuntimeError("upstream failed after retries: The read operation timed out")
+        return 200, {"choices": [{"message": {"content": "ok from b"}}]}, {}, _key(1)
+
+    upstream = AsyncMock()
+    upstream.request_json = fake_json
+    ex = FallbackExecutor(upstream, reg, settings)
+    ex._provider_available = lambda _m: True  # type: ignore[method-assign]
+    decision = _auto(["model-a", "model-b"])
+
+    result = await ex.execute_json("/chat/completions", {"messages": []}, decision)
+    assert result.status_code == 200
+    assert result.model == "model-b"
+    assert calls == ["model-a", "model-b"]
+    assert ex.stats.fallback_advances >= 1
+
+
+# ── T15: HTTP 503 from model cools model-tier without opening provider breaker (D3) ──
+
+
+@pytest.mark.asyncio
+async def test_http_503_cools_model_without_opening_provider_breaker() -> None:
+    """HTTP 503 is a model-tier overload condition, not a provider transport death.
+    Provider breaker must remain CLOSED.
+    """
+    settings = Settings(
+        nim_api_keys=["k"],
+        max_model_fallbacks=3,
+        request_deadline_seconds=30.0,
+        retry_backoff_base_seconds=0.0,
+        retry_backoff_cap_seconds=0.0,
+    )
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-b"}
+
+    async def fake_json(method, path, **kwargs):
+        model = (kwargs.get("json_body") or {}).get("model", "")
+        if model == "model-a":
+            return 503, {"error": {"message": "Model overloaded"}}, {}, _key()
+        return 200, {"choices": [{"message": {"content": "b ok"}}]}, {}, _key(1)
+
+    upstream = AsyncMock()
+    upstream.request_json = fake_json
+    cb = ProviderCircuitBreaker(failure_threshold=2)  # Low threshold
+    ex = FallbackExecutor(upstream, reg, settings, hub=_hub_stub(cb, {"model-a": upstream, "model-b": upstream}))
+    ex._provider_available = lambda _m: True  # type: ignore[method-assign]
+    ex._provider_id_for = lambda m: "nim"  # type: ignore[method-assign]
+
+    decision = _auto(["model-a", "model-b"])
+    result = await ex.execute_json("/chat/completions", {"messages": []}, decision)
+    assert result.status_code == 200
+    assert result.model == "model-b"
+    # Model A is cooled down:
+    assert cb.is_model_on_cooldown("model-a")
+    # But provider breaker is STILL CLOSED!
+    assert cb.state("nim") == BreakerState.CLOSED
+
+
+# ── T16: Hedged secondary win does not increment provider transport failure count ──
+
+
+@pytest.mark.asyncio
+async def test_hedged_secondary_win_does_not_fail_provider_transport() -> None:
+    """When a secondary hedged stream completes first, primary is abandoned but primary provider
+    breaker must NOT count it as a transport failure.
+    """
+    import asyncio as _aio
+
+    settings = Settings(
+        nim_api_keys=["k"],
+        max_model_fallbacks=5,
+        request_deadline_seconds=30.0,
+        retry_backoff_base_seconds=0.0,
+        retry_backoff_cap_seconds=0.0,
+        enable_parallel_hedge=True,
+        parallel_hedge_delay_seconds=0.02,
+    )
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"p1/model-a", "p2/model-b"}
+
+    async def fake_stream(method, path, **kwargs):
+        model = (kwargs.get("json_body") or {}).get("model", "")
+
+        async def slow():
+            await _aio.sleep(2.0)
+            yield b"data: slow\n\n"
+
+        async def fast():
+            yield b'data: {"choices": [{"delta": {"content": "fast"}}]}\n\n'
+
+        if "model-a" in model:
+            return 200, slow(), {"content-type": "text/event-stream"}, _key()
+        return 200, fast(), {"content-type": "text/event-stream"}, _key(1)
+
+    upstream = AsyncMock()
+    upstream.stream = fake_stream
+    cb = ProviderCircuitBreaker(failure_threshold=1)  # Threshold=1: any transport fail would trip OPEN!
+    ex = FallbackExecutor(upstream, reg, settings, hub=_hub_stub(cb, {"p1/model-a": upstream, "p2/model-b": upstream}))
+    ex._provider_available = lambda _m: True  # type: ignore[method-assign]
+    ex._client_for = lambda m: (upstream, m)  # type: ignore[method-assign]
+    ex._provider_id_for = lambda m: m.split("/")[0]  # type: ignore[method-assign]
+
+    decision = _auto(["p1/model-a", "p2/model-b"])
+    result = await ex.execute_stream("/chat/completions", {"messages": []}, decision)
+    assert result.status_code == 200
+    assert result.model == "p2/model-b"
+    assert ex.stats.hedge_wins == 1
+    # p1 circuit breaker MUST NOT be tripped!
+    assert cb.state("p1") == BreakerState.CLOSED
+
+
+# ── T17: Horizontal provider discovery for explicit model ──
+
+
+def test_horizontal_provider_discovery_for_explicit_model() -> None:
+    """When enable_fallback_on_explicit=True, selector discovers same model across providers."""
+    from potato.routing.classifier import IntentResult
+    from potato.routing.selector import ModelSelector
+
+    settings = Settings(
+        nim_api_keys=["k"],
+        enable_fallback_on_explicit=True,
+    )
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {
+        "groq/llama-3.3-70b",
+        "together/llama-3.3-70b",
+        "sambanova/llama-3.3-70b",
+        "qwen/qwen-2.5-72b",
+    }
+    reg.ladder.provider_ids = {"groq", "together", "sambanova", "qwen", "nim"}
+
+    selector = ModelSelector(reg, settings)
+    intent_res = IntentResult(intent=Intent.CHAT_FAST, confidence=0.95, rule_id="test")
+    decision = selector.resolve("groq/llama-3.3-70b", intent_res)
+
+    assert decision.mode == "passthrough_with_fallback"
+    assert decision.chain[0] == "groq/llama-3.3-70b"
+    assert "together/llama-3.3-70b" in decision.chain[1:3]
+    assert "sambanova/llama-3.3-70b" in decision.chain[1:3]
+
+
+# ── T18: Robust iter suppresses raw in-band error frames ──
+
+
+@pytest.mark.asyncio
+async def test_robust_iter_suppresses_raw_upstream_error_chunk() -> None:
+    """When an upstream stream returns 200 followed by an in-band error frame,
+    robust_iter suppresses the raw error chunk and emits a clean OpenAI SSE finish event.
+    """
+    settings = Settings(nim_api_keys=["k"])
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a"}
+
+    async def fake_error_stream():
+        yield b'data: {"id":"1","choices":[{"delta":{"content":"starting"}}]}\n\n'
+        yield b'data: {"error":{"message":"Midstream failure","code":"model_error"}}\n\n'
+
+    async def fake_stream(method, path, **kwargs):
+        return 200, fake_error_stream(), {"content-type": "text/event-stream"}, _key()
+
+    upstream = AsyncMock()
+    upstream.stream = fake_stream
+    ex = FallbackExecutor(upstream, reg, settings)
+    ex._provider_available = lambda _m: True  # type: ignore[method-assign]
+    ex._client_for = lambda m: (upstream, m)  # type: ignore[method-assign]
+
+    decision = _auto(["model-a"])
+    result = await ex.execute_stream("/chat/completions", {"messages": [], "stream": True}, decision)
+    assert result.status_code == 200
+
+    chunks = [c async for c in result.byte_iter]
+    combined = b"".join(chunks)
+
+    # First chunk was content
+    assert b"starting" in combined
+    # Raw unparsed error JSON was suppressed and replaced by potato-stream-error
+    assert b"potato-stream-error" in combined
+    assert b"Midstream failure" in combined
+    assert b"data: [DONE]" in combined

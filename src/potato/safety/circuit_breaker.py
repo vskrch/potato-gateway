@@ -136,9 +136,8 @@ class ProviderCircuitBreaker:
         Only transport/connectivity failures (502, 503, 504, connect timeout)
         penalize the provider circuit breaker.
         """
-        if model_id and not is_transport:
+        if model_id:
             self.model_fail(model_id)
-            return
 
         if not is_transport:
             return
@@ -191,10 +190,16 @@ class ProviderCircuitBreaker:
         if model_id:
             self.model_succeed(model_id)
         pid = provider_id.lower()
+        now = time.monotonic()
         self._state[pid] = BreakerState.CLOSED
         self._failures[pid] = 0
         self._open_until.pop(pid, None)
-        self._success_times.setdefault(pid, []).append(time.monotonic())
+        # Bound history: keep only in-window successes.
+        times = self._success_times.setdefault(pid, [])
+        times.append(now)
+        cutoff = now - self.window_seconds
+        while times and times[0] < cutoff:
+            times.pop(0)
         if pid in self._last_probe:
             logger.info("circuit closed for provider %s (probe succeeded)", pid)
 
@@ -207,6 +212,8 @@ class ProviderCircuitBreaker:
         self._failures[pid] = 0
         self._open_until.pop(pid, None)
         self._fail_times.pop(pid, None)
+        self._success_times.pop(pid, None)
+        self._last_force.pop(pid, None)
 
     def snapshot(self) -> dict[str, dict]:
         now = time.monotonic()

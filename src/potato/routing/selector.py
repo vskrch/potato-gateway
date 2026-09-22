@@ -387,14 +387,40 @@ class ModelSelector:
                     resolved = raw
             if resolved is not None:
                 if self.settings.enable_fallback_on_explicit:
+                    from potato.catalog.providers import split_provider_model
+
+                    ladder = getattr(self.registry, "ladder", None)
+                    provider_ids = getattr(ladder, "provider_ids", set()) if ladder else set()
+                    _, resolved_upstream = split_provider_model(resolved, provider_ids)
+                    bare = resolved_upstream.split("/")[-1].lower() if "/" in resolved_upstream else resolved_upstream.lower()
+
+                    active_all = self.registry.active_live_ids() if hasattr(self.registry, "active_live_ids") else set()
                     siblings = self.registry.chain_for_intent(intent_key, variant=variant)
-                    bare = resolved.split("/")[-1] if "/" in resolved else resolved
-                    horizontals = [
-                        m
-                        for m in siblings
-                        if (m.split("/")[-1] if "/" in m else m) == bare and m != resolved
-                    ]
-                    rest = [m for m in siblings if m != resolved and m not in horizontals]
+
+                    horizontals: list[str] = []
+                    seen_horizontals: set[str] = {resolved.lower()}
+
+                    for m in sorted(active_all):
+                        m_lower = m.lower()
+                        if m_lower in seen_horizontals:
+                            continue
+                        _, m_upstream = split_provider_model(m, provider_ids)
+                        m_bare = m_upstream.split("/")[-1].lower() if "/" in m_upstream else m_upstream.lower()
+                        if m_upstream.lower() == resolved_upstream.lower() or m_bare == bare:
+                            horizontals.append(m)
+                            seen_horizontals.add(m_lower)
+
+                    for s in siblings:
+                        s_lower = s.lower()
+                        if s_lower in seen_horizontals:
+                            continue
+                        _, s_upstream = split_provider_model(s, provider_ids)
+                        s_bare = s_upstream.split("/")[-1].lower() if "/" in s_upstream else s_upstream.lower()
+                        if s_upstream.lower() == resolved_upstream.lower() or s_bare == bare:
+                            horizontals.append(s)
+                            seen_horizontals.add(s_lower)
+
+                    rest = [m for m in siblings if m.lower() not in seen_horizontals]
                     rest_opt = self.registry.health_reorder(
                         rest, intent=intent_key, variant=variant
                     )

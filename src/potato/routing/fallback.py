@@ -27,7 +27,7 @@ SpanCallback = Callable[["TraceSpan"], None]
 
 # D3: model-tier statuses cool only the model, never the provider transport
 # breaker. Everything else >= 400 that is retryable is transport-class.
-MODEL_TIER_STATUSES = frozenset({400, 401, 403, 404, 405, 408, 413, 422, 429})
+MODEL_TIER_STATUSES = frozenset({400, 401, 403, 404, 405, 408, 413, 422, 429, 503, 529})
 
 
 @dataclass
@@ -528,7 +528,6 @@ class FallbackExecutor:
         except Exception:
             logger.debug("recovery chain rebuild failed", exc_info=True)
             chain_retry = []
-        pools.append(chain_retry)
         if not chain_retry:
             try:
                 chain_retry = self._heal_empty_chain(
@@ -548,7 +547,7 @@ class FallbackExecutor:
                     )
                 except Exception:
                     chain_retry = []
-            pools[1] = chain_retry
+        pools.append(chain_retry)
         seen, fresh = set(tried), []
         for pool in pools:
             for m in pool:
@@ -847,6 +846,7 @@ class FallbackExecutor:
                         forward_headers=forward_headers,
                         preferred_key_id=preferred_key_id,
                         max_retries=1,
+                        acquire_timeout=min(2.0, budget),
                     ),
                     timeout=budget,
                 )
@@ -1049,42 +1049,90 @@ class FallbackExecutor:
 
         Opens the secondary stream only when the primary is slow, then races
         both first chunks. Returns (first_chunk, full_iter, winner) where
-        winner = {"side": "primary"|"secondary", "model", "pid", "key",
-        "headers", "status"}. The loser is closed and its TTFT recorded.
+        winner = {"side": "primary"|"secondary", ...}. The loser is closed
+        and its TTFT recorded. Raises TimeoutError when neither delivers in
+        time (caller takes the TTFT-stall path) and StopAsyncIteration when
+        the winning stream is empty (caller takes the empty-stream path).
+
+        Never cancels-then-reuses an iterator: cancelling a waiter athrows
+        into the underlying async generator, which would corrupt a stream we
+        still intend to serve. Losers are only cancelled once abandoned.
         """
         import asyncio as _aio_h
 
-        async def _first(it: AsyncIterator[bytes]) -> bytes:
-            try:
-                return await anext(it)
-            except StopAsyncIteration:
-                return b""
+        def _done_result(task: Any) -> tuple[bool, bytes | None, BaseException | None]:
+            """(finished_ok, chunk, error) for a completed anext task."""
+            exc = task.exception()
+            if exc is None:
+                return True, task.result(), None
+            if isinstance(exc, StopAsyncIteration):
+                return True, b"", None
+            return True, None, exc
 
-        # Head start for the primary.
-        try:
-            first = await _aio_h.wait_for(_first(primary_iter), timeout=hedge_delay)
-            return first, primary_iter, {"side": "primary"}
-        except (TimeoutError, StopAsyncIteration, Exception):
-            pass  # primary slow/empty — open the hedge
+        primary_task = _aio_h.ensure_future(anext(primary_iter))
+        done, _ = await _aio_h.wait({primary_task}, timeout=max(0.05, hedge_delay))
+        if primary_task in done:
+            ok, chunk, err = _done_result(primary_task)
+            if err is not None:
+                raise err
+            if chunk == b"":
+                raise StopAsyncIteration
+            return chunk, primary_iter, {"side": "primary"}
 
-        self.stats.hedge_attempts += 1
+        # Primary is slow — open the hedge. The primary waiter keeps running.
         try:
             sec = await open_secondary()
         except Exception:
-            # Hedge failed to open — fall back to racing the primary alone.
-            try:
-                first = await _aio_h.wait_for(_first(primary_iter), timeout=race_timeout)
-                return first, primary_iter, {"side": "primary"}
-            except StopAsyncIteration:
-                return b"", primary_iter, {"side": "primary"}
+            # Hedge failed to open — wait out the primary alone.
+            done, _ = await _aio_h.wait({primary_task}, timeout=max(1.0, race_timeout))
+            if primary_task in done:
+                ok, chunk, err = _done_result(primary_task)
+                if err is not None:
+                    raise err
+                if chunk == b"":
+                    raise StopAsyncIteration
+                return chunk, primary_iter, {"side": "primary"}
+            primary_task.cancel()
+            with suppress(BaseException):
+                await primary_task
+            raise TimeoutError("hedged primary TTFT expired")
+        self.stats.hedge_attempts += 1
         if sec is None:
-            try:
-                first = await _aio_h.wait_for(_first(primary_iter), timeout=race_timeout)
-                return first, primary_iter, {"side": "primary"}
-            except StopAsyncIteration:
-                return b"", primary_iter, {"side": "primary"}
+            done, _ = await _aio_h.wait({primary_task}, timeout=max(1.0, race_timeout))
+            if primary_task in done:
+                ok, chunk, err = _done_result(primary_task)
+                if err is not None:
+                    raise err
+                if chunk == b"":
+                    raise StopAsyncIteration
+                return chunk, primary_iter, {"side": "primary"}
+            primary_task.cancel()
+            with suppress(BaseException):
+                await primary_task
+            raise TimeoutError("hedged primary TTFT expired")
 
         s_status, s_iter, s_headers, s_key = sec
+        s_ct = (s_headers.get("content-type") or s_headers.get("Content-Type") or "").lower()
+        # H(a): only an SSE secondary can serve the hedge — a 200 JSON body
+        # would relay raw JSON bytes to an SSE client. Close it without
+        # recording a failure (the model is fine; it just isn't streaming).
+        if 200 <= s_status < 300 and "application/json" in s_ct and "text/event-stream" not in s_ct:
+            with suppress(Exception):
+                aclose = getattr(s_iter, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            done, _ = await _aio_h.wait({primary_task}, timeout=max(1.0, race_timeout))
+            if primary_task in done:
+                ok, chunk, err = _done_result(primary_task)
+                if err is not None:
+                    raise err
+                if chunk == b"":
+                    raise StopAsyncIteration
+                return chunk, primary_iter, {"side": "primary"}
+            primary_task.cancel()
+            with suppress(BaseException):
+                await primary_task
+            raise TimeoutError("hedged primary TTFT expired")
         if not (200 <= s_status < 300):
             with suppress(Exception):
                 aclose = getattr(s_iter, "aclose", None)
@@ -1095,72 +1143,92 @@ class FallbackExecutor:
                 decision, secondary_model, getattr(s_key, "key_id", None),
                 success=False, status_code=s_status, intent=decision.intent.value,
             )
-            try:
-                first = await _aio_h.wait_for(_first(primary_iter), timeout=race_timeout)
-                return first, primary_iter, {"side": "primary"}
-            except StopAsyncIteration:
-                return b"", primary_iter, {"side": "primary"}
+            done, _ = await _aio_h.wait({primary_task}, timeout=max(1.0, race_timeout))
+            if primary_task in done:
+                ok, chunk, err = _done_result(primary_task)
+                if err is not None:
+                    raise err
+                if chunk == b"":
+                    raise StopAsyncIteration
+                return chunk, primary_iter, {"side": "primary"}
+            primary_task.cancel()
+            with suppress(BaseException):
+                await primary_task
+            raise TimeoutError("hedged primary TTFT expired")
 
         # Race both first chunks.
-        primary_task = _aio_h.ensure_future(_first(primary_iter))
-        secondary_task = _aio_h.ensure_future(_first(s_iter))
+        sec_task = _aio_h.ensure_future(anext(s_iter))
         done, pending = await _aio_h.wait(
-            {primary_task, secondary_task},
+            {primary_task, sec_task},
             timeout=max(1.0, race_timeout),
             return_when=_aio_h.FIRST_COMPLETED,
         )
-        if secondary_task in done and primary_task not in done:
-            # Secondary wins — close the slow primary, record its stall.
-            primary_task.cancel()
+        if sec_task in done and primary_task not in done:
+            sec_exc = sec_task.exception()
+            if sec_exc is None:
+                # Secondary wins — abandon the slow primary.
+                primary_task.cancel()
+                with suppress(BaseException):
+                    await primary_task
+                with suppress(Exception):
+                    aclose = getattr(primary_iter, "aclose", None)
+                    if aclose is not None:
+                        await aclose()
+                self._circuit_fail(primary_pid, is_transport=False, model_id=primary_model)
+                self._record_outcome(
+                    decision, primary_model, getattr(primary_key, "key_id", None),
+                    success=False, status_code=504, intent=decision.intent.value,
+                )
+                self.stats.hedge_wins += 1
+                return sec_task.result(), s_iter, {
+                    "side": "secondary", "model": secondary_model, "pid": secondary_pid,
+                    "key": s_key, "headers": s_headers, "status": s_status,
+                }
+            # Empty/errored secondary — close it, keep waiting on the primary.
+            # A real secondary error is still worth recording (model-tier) so
+            # health learns even though the primary decides the request.
+            if sec_exc is not None and not isinstance(sec_exc, StopAsyncIteration):
+                self._record_circuit(secondary_pid, model=secondary_model, status=502)
+                self._record_outcome(
+                    decision, secondary_model, getattr(s_key, "key_id", None),
+                    success=False, status_code=502, intent=decision.intent.value,
+                )
             with suppress(Exception):
-                await primary_task
-            with suppress(Exception):
-                aclose = getattr(primary_iter, "aclose", None)
+                aclose = getattr(s_iter, "aclose", None)
                 if aclose is not None:
                     await aclose()
-            self._circuit_fail(primary_pid, model_id=primary_model)
-            self._record_outcome(
-                decision, primary_model, getattr(primary_key, "key_id", None),
-                success=False, status_code=504, intent=decision.intent.value,
-            )
-            self.stats.hedge_wins += 1
-            s_first = secondary_task.result() if not secondary_task.cancelled() else b""
-            for t in pending:
-                t.cancel()
-                with suppress(Exception):
-                    await t
-            return s_first, s_iter, {
-                "side": "secondary", "model": secondary_model, "pid": secondary_pid,
-                "key": s_key, "headers": s_headers, "status": s_status,
-            }
-        # Primary wins (or nothing finished) — close the hedge.
-        secondary_task.cancel()
-        with suppress(Exception):
-            await secondary_task
+            done, _ = await _aio_h.wait({primary_task}, timeout=max(1.0, race_timeout))
+            if primary_task in done:
+                ok, chunk, err = _done_result(primary_task)
+                if err is not None:
+                    raise err
+                if chunk == b"":
+                    raise StopAsyncIteration
+                return chunk, primary_iter, {"side": "primary"}
+            primary_task.cancel()
+            with suppress(BaseException):
+                await primary_task
+            raise TimeoutError("hedged primary TTFT expired")
+        # Primary finished first (or nothing did) — retire the hedge.
+        sec_task.cancel()
+        with suppress(BaseException):
+            await sec_task
         with suppress(Exception):
             aclose = getattr(s_iter, "aclose", None)
             if aclose is not None:
                 await aclose()
-        if primary_task in done and not primary_task.cancelled():
-            try:
-                first = primary_task.result()
-            except StopAsyncIteration:
-                first = b""
-            for t in pending:
-                t.cancel()
-                with suppress(Exception):
-                    await t
-            return first, primary_iter, {"side": "primary"}
+        if primary_task in done:
+            ok, chunk, err = _done_result(primary_task)
+            if err is not None:
+                raise err
+            if chunk == b"":
+                raise StopAsyncIteration
+            return chunk, primary_iter, {"side": "primary"}
         for t in pending:
             t.cancel()
-            with suppress(Exception):
+            with suppress(BaseException):
                 await t
-        try:
-            first = await _aio_h.wait_for(_first(primary_iter), timeout=max(1.0, race_timeout))
-            return first, primary_iter, {"side": "primary"}
-        except StopAsyncIteration:
-            return b"", primary_iter, {"side": "primary"}
-
+        raise TimeoutError("hedged TTFT expired")
     def _is_auto_decision(self, decision: RouteDecision) -> bool:
         """True when the client asked for auto routing (potato/auto etc.).
 
@@ -1740,12 +1808,24 @@ class FallbackExecutor:
                         forward_headers=forward_headers,
                         preferred_key_id=preferred_key_id,
                         max_retries=2,
+                        # H(b): bound the acquire wait so pool-exhaustion
+                        # surfaces as capacity, not a transport stall.
+                        acquire_timeout=min(2.0, attempt_budget),
                     ),
                     timeout=attempt_budget,
                 )
             except TimeoutError:
                 attempts += 1
-                self._circuit_fail(pid, model_id=model)
+                self._circuit_fail(pid, is_transport=False, model_id=model)
+                self._record_outcome(
+                    decision,
+                    model,
+                    getattr(key, "key_id", None) if "key" in locals() else None,
+                    success=False,
+                    status_code=504,
+                    intent=decision.intent.value,
+                    latency=(time.perf_counter() - t_attempt),
+                )
                 self._emit_span(
                     self._make_upstream_span(
                         model=model,
@@ -1785,18 +1865,6 @@ class FallbackExecutor:
                 break
             except (RuntimeError, httpx.HTTPError, OSError) as exc:
                 attempts += 1
-                msg = str(exc).lower()
-                retryable_pool = (
-                    isinstance(exc, (httpx.HTTPError, OSError))
-                    or "rate-limited" in msg
-                    or "cooling" in msg
-                    or "unavailable" in msg
-                    or "no api keys" in msg
-                    or "not available" in msg
-                    or "provider" in msg
-                    or "circuit" in msg
-                    or "invalid json" in msg
-                )
                 # D3: capacity (pool exhaustion) cools the model tier only.
                 if isinstance(exc, KeyPoolExhausted):
                     if self.hub is not None:
@@ -1805,6 +1873,15 @@ class FallbackExecutor:
                             cb.fail(pid or "", is_transport=False, model_id=model)
                 else:
                     self._circuit_fail(pid, model_id=model)
+                self._record_outcome(
+                    decision,
+                    model,
+                    getattr(key, "key_id", None) if "key" in locals() else None,
+                    success=False,
+                    status_code=503,
+                    intent=decision.intent.value,
+                    latency=(time.perf_counter() - t_attempt),
+                )
                 self._emit_span(
                     self._make_upstream_span(
                         model=model,
@@ -1813,12 +1890,11 @@ class FallbackExecutor:
                         success=False,
                         error_message=str(exc),
                         span_type="fallback_advance"
-                        if (advance_on_pool or isinstance(exc, (httpx.HTTPError, OSError)))
-                        and idx < len(chain) - 1
+                        if idx < len(chain) - 1
                         else "upstream",
                     )
                 )
-                if retryable_pool and idx < len(chain) - 1:
+                if idx < len(chain) - 1:
                     self.stats.fallback_advances += 1
                     await sleep_backoff(
                         idx,
@@ -1827,33 +1903,35 @@ class FallbackExecutor:
                         max_delay=max(0.0, (deadline - time.monotonic()) - 2.0),
                     )
                     logger.info(
-                        "provider/transport unavailable on %s (%s); advancing model",
+                        "provider/transport error on %s (%s); advancing model",
                         model,
                         exc,
                     )
                     continue
-                if retryable_pool:
-                    # Last model pool-exhausted — do NOT return cold; fall
-                    # through to last-resort force-allow + fresh-model retry.
-                    last = UpstreamResult(
-                        status_code=503,
-                        body={
-                            "error": {
-                                "message": str(exc),
-                                "type": "server_error",
-                                "code": "potato_pool_exhausted",
-                            }
-                        },
-                        headers={},
-                        key=None,
-                        model=model,
-                        fallback_index=idx,
-                        decision=decision,
-                        upstream_ms=(time.perf_counter() - t_attempt) * 1000,
-                        provider_id=pid,
-                    )
-                    break
-                raise
+                # Last model error — do NOT return cold; fall through to
+                # last-resort force-allow + fresh-model retry.
+                last = UpstreamResult(
+                    status_code=503,
+                    body={
+                        "error": {
+                            "message": str(exc),
+                            "type": "server_error",
+                            "code": (
+                                "potato_pool_exhausted"
+                                if isinstance(exc, KeyPoolExhausted)
+                                else "potato_upstream_error"
+                            ),
+                        }
+                    },
+                    headers={},
+                    key=None,
+                    model=model,
+                    fallback_index=idx,
+                    decision=decision,
+                    upstream_ms=(time.perf_counter() - t_attempt) * 1000,
+                    provider_id=pid,
+                )
+                break
 
             attempts += 1
             key_id = key.key_id if key else None
@@ -1862,7 +1940,7 @@ class FallbackExecutor:
             if success:
                 self._circuit_succeed(pid, model_id=model)
             elif status >= 500:
-                self._record_circuit(pid, model=model, transport=True)
+                self._record_circuit(pid, model=model, status=status)
             had_tools = bool(
                 (body.get("tools") or body.get("functions"))
                 or body.get("tool_choice") not in (None, "none", "None")
@@ -2030,8 +2108,10 @@ class FallbackExecutor:
             # force-allow every provider (that defeats the breaker during
             # incidents). hub.client_for_model already force-allows when ALL
             # providers are open; single-provider recovery uses probe timers.
-            remaining = deadline - time.monotonic()
-            if remaining >= 5.0 and attempts < max_attempts:
+            # P1-4: recovery runs until 85% of the deadline; the final slice
+            # is reserved for the structured error envelope + logging.
+            phases = self._phase_deadlines(deadline, time.monotonic())
+            if time.monotonic() < phases["recovery"] and attempts < max_attempts:
                 self.stats.recovery_entered += 1
                 tried = {m.lower() for m in chain}
                 can_recover_wide = self._is_auto_decision(decision) or getattr(
@@ -2087,6 +2167,7 @@ class FallbackExecutor:
                                     forward_headers=forward_headers,
                                     preferred_key_id=preferred_key_id,
                                     max_retries=2,
+                                    acquire_timeout=min(2.0, budget2),
                                 ),
                                 timeout=budget2,
                             )
@@ -2226,8 +2307,8 @@ class FallbackExecutor:
                 self.settings, "allow_graceful_fallback_on_explicit", False
             )
             if last.status_code >= 400 and can_graceful:
-                remaining = deadline - time.monotonic()
-                if remaining >= 3.0 and attempts < max_attempts:
+                phases = self._phase_deadlines(deadline, time.monotonic())
+                if time.monotonic() < phases["recovery"] and attempts < max_attempts:
                     try:
                         any_live = self._any_available_live_models(
                             had_tools=had_tools,
@@ -2425,12 +2506,22 @@ class FallbackExecutor:
                         forward_headers=forward_headers,
                         preferred_key_id=preferred_key_id,
                         max_retries=2,
+                        acquire_timeout=min(2.0, attempt_budget),
                     ),
                     timeout=attempt_budget,
                 )
             except TimeoutError:
                 attempts += 1
-                self._circuit_fail(pid, model_id=model)
+                self._circuit_fail(pid, is_transport=False, model_id=model)
+                self._record_outcome(
+                    decision,
+                    model,
+                    getattr(key, "key_id", None) if "key" in locals() else None,
+                    success=False,
+                    status_code=504,
+                    intent=decision.intent.value,
+                    latency=(time.perf_counter() - t_attempt),
+                )
                 self._emit_span(
                     self._make_upstream_span(
                         model=model,
@@ -2464,6 +2555,15 @@ class FallbackExecutor:
                             cb.fail(pid or "", is_transport=False, model_id=model)
                 else:
                     self._circuit_fail(pid, model_id=model)
+                self._record_outcome(
+                    decision,
+                    model,
+                    getattr(key, "key_id", None) if "key" in locals() else None,
+                    success=False,
+                    status_code=503,
+                    intent=decision.intent.value,
+                    latency=(time.perf_counter() - t_attempt),
+                )
                 self._emit_span(
                     self._make_upstream_span(
                         model=model,
@@ -2596,6 +2696,7 @@ class FallbackExecutor:
                                     forward_headers=forward_headers,
                                     preferred_key_id=preferred_key_id,
                                     max_retries=1,
+                                    acquire_timeout=min(2.0, _h_budget),
                                 ),
                                 timeout=_h_budget,
                             )
@@ -2792,7 +2893,9 @@ class FallbackExecutor:
                         nonlocal _upstream_done, _upstream_error, total_tokens
                         try:
                             async for chunk in rest:
-                                _scan_for_tokens(chunk)
+                                is_err = _scan_for_tokens(chunk)
+                                if is_err:
+                                    break
                                 await _bp_queue.put(chunk)
                         except Exception as e:
                             _upstream_error = e
@@ -2803,7 +2906,7 @@ class FallbackExecutor:
 
                     upstream_error_frame: dict | None = None
 
-                    def _scan_for_tokens(c: bytes) -> None:
+                    def _scan_for_tokens(c: bytes) -> bool:
                         nonlocal total_tokens, upstream_error_frame
                         if b'"usage"' in c or b"completion_tokens" in c:
                             import re
@@ -2833,7 +2936,8 @@ class FallbackExecutor:
                                     continue
                                 if isinstance(obj, dict) and isinstance(obj.get("error"), dict):
                                     upstream_error_frame = obj["error"]
-                                    break
+                                    return True
+                        return upstream_error_frame is not None
 
                     async def _emit_stream_error(
                         err_msg: str, *, code: str
@@ -2881,8 +2985,9 @@ class FallbackExecutor:
                     producer_task = asyncio.create_task(_producer())
                     try:
                         if first:
-                            _scan_for_tokens(first)
-                            yield first
+                            is_err = _scan_for_tokens(first)
+                            if not is_err:
+                                yield first
                         while True:
                             try:
                                 chunk = await asyncio.wait_for(_bp_queue.get(), timeout=idle_s)
@@ -3122,9 +3227,10 @@ class FallbackExecutor:
 
         # ── Last-resort: retry fresh models from the widest pool ──
         # D4: scoped recovery — no global cooldown wipe / force-allow-all.
-        remaining = deadline - time.monotonic()
+        # P1-4: recovery runs until 85% of the deadline (see execute_json).
         last_resort_tried: list[str] = []
-        if remaining >= 5.0 and last_status >= 400 and attempts < max_attempts:
+        phases = self._phase_deadlines(deadline, time.monotonic())
+        if time.monotonic() < phases["recovery"] and last_status >= 400 and attempts < max_attempts:
             self.stats.recovery_entered += 1
             tried = {m.lower() for m in chain}
             can_recover_wide = self._is_auto_decision(decision) or getattr(
@@ -3187,6 +3293,7 @@ class FallbackExecutor:
                                 forward_headers=forward_headers,
                                 preferred_key_id=preferred_key_id,
                                 max_retries=2,
+                                acquire_timeout=min(2.0, budget2),
                             ),
                             timeout=budget2,
                         )
@@ -3517,8 +3624,8 @@ class FallbackExecutor:
             and not saw_deadline
             and can_graceful_stream
         ):
-            remaining = deadline - time.monotonic()
-            if remaining >= 3.0 and attempts < max_attempts:
+            phases = self._phase_deadlines(deadline, time.monotonic())
+            if time.monotonic() < phases["recovery"] and attempts < max_attempts:
                 try:
                     any_live = self._any_available_live_models(
                         had_tools=had_tools,
@@ -3581,6 +3688,7 @@ class FallbackExecutor:
                                         forward_headers=forward_headers,
                                         preferred_key_id=preferred_key_id,
                                         max_retries=2,
+                                        acquire_timeout=min(2.0, budget_g),
                                     ),
                                     timeout=budget_g,
                                 )
