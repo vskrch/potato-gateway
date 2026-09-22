@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -15,6 +16,14 @@ from potato.balancer import KeyPool, KeyStats
 from potato.safety.backoff import sleep_backoff
 
 logger = logging.getLogger(__name__)
+
+
+class KeyPoolExhausted(RuntimeError):
+    """Raised when no API key can be acquired (rate-limited / cooling / budget).
+
+    Capacity, not transport (D3): callers must cool the model/key tier and
+    advance — never trip the provider transport breaker.
+    """
 
 
 def parse_retry_after(value: str | None) -> float | None:
@@ -41,6 +50,8 @@ class UpstreamClient:
         timeout: float = 300.0,
         *,
         connect_timeout: float = 5.0,
+        pool_timeout: float = 10.0,
+        write_timeout: float = 30.0,
         user_agent: str | None = None,
         proxy_url: str | None = None,
         retry_backoff_base: float = 0.5,
@@ -50,6 +61,8 @@ class UpstreamClient:
         self.pool = pool
         self.timeout = timeout
         self.connect_timeout = connect_timeout
+        self.pool_timeout = pool_timeout
+        self.write_timeout = write_timeout
         self.user_agent = user_agent
         self.proxy_url = proxy_url
         self.retry_backoff_base = retry_backoff_base
@@ -59,7 +72,14 @@ class UpstreamClient:
     async def start(self) -> None:
         kwargs: dict[str, Any] = {
             "base_url": self.base_url,
-            "timeout": httpx.Timeout(self.timeout, connect=self.connect_timeout),
+            # D6c: fail fast on pool saturation / slow writes instead of
+            # stalling the full generation timeout (was read=pool=write=timeout).
+            "timeout": httpx.Timeout(
+                self.timeout,
+                connect=self.connect_timeout,
+                pool=self.pool_timeout,
+                write=self.write_timeout,
+            ),
             "follow_redirects": True,
             "limits": httpx.Limits(
                 max_connections=200,
@@ -134,7 +154,10 @@ class UpstreamClient:
         """
         last_error: BaseException | None = None
         for attempt in range(max_retries):
-            key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+            try:
+                key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+            except RuntimeError as exc:
+                raise KeyPoolExhausted(str(exc)) from exc
             released = False
             started = time.monotonic()
             try:
@@ -242,9 +265,13 @@ class UpstreamClient:
         """
         last_error: BaseException | None = None
         for attempt in range(max_retries):
-            key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+            try:
+                key = await self.pool.acquire(preferred_key_id=preferred_key_id)
+            except RuntimeError as exc:
+                raise KeyPoolExhausted(str(exc)) from exc
             released = False
             started = time.monotonic()
+            resp: httpx.Response | None = None
             try:
                 req = self.client.build_request(
                     method,
@@ -361,6 +388,11 @@ class UpstreamClient:
                 released = True  # key release is now the byte_iter's responsibility
                 return status_code, byte_iter(), out_headers, key
             except BaseException as exc:
+                # D6b: never leak the streamed response on cancellation — close
+                # the upstream socket before releasing the key.
+                if resp is not None:
+                    with suppress(Exception):
+                        await resp.aclose()
                 # Cancel-safe: release key even on cancellation/task abort
                 if not released:
                     await self.pool.release(key, success=False)

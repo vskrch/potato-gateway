@@ -364,18 +364,28 @@ async def normalize_sse_stream(
     routed_model: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Line-buffer SSE stream and normalize each data: JSON event for Cursor."""
+    from contextlib import suppress
+
     buffer = b""
-    async for raw in source:
-        buffer += raw
-        while True:
-            nl = buffer.find(b"\n")
-            if nl < 0:
-                break
-            line = buffer[: nl + 1]
-            buffer = buffer[nl + 1 :]
-            yield transform_sse_bytes(line, routed_model=routed_model)
-    if buffer:
-        yield transform_sse_bytes(buffer, routed_model=routed_model)
+    try:
+        async for raw in source:
+            buffer += raw
+            while True:
+                nl = buffer.find(b"\n")
+                if nl < 0:
+                    break
+                line = buffer[: nl + 1]
+                buffer = buffer[nl + 1 :]
+                yield transform_sse_bytes(line, routed_model=routed_model)
+        if buffer:
+            yield transform_sse_bytes(buffer, routed_model=routed_model)
+    finally:
+        # D6b: deterministic cleanup — never rely on GC finalizers to release
+        # the upstream iterator (and its key in_flight slot).
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            with suppress(Exception):
+                await aclose()
 
 
 def frame_sse_error(

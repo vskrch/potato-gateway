@@ -20,6 +20,14 @@ from potato.upstream import UpstreamClient
 logger = logging.getLogger(__name__)
 
 
+class ProviderCircuitOpen(RuntimeError):
+    """Raised when a provider's transport circuit is open (D2: a SKIP, not a failure)."""
+
+
+class ProviderNotConfigured(RuntimeError):
+    """Raised when a provider has no runtime / is disabled / has no keys (D2)."""
+
+
 @dataclass
 class ProviderRuntime:
     config: ProviderConfig
@@ -122,6 +130,8 @@ class ProviderHub:
             pool=pool,
             timeout=self.settings.upstream_timeout,
             connect_timeout=getattr(self.settings, "upstream_connect_timeout_seconds", 5.0),
+            pool_timeout=getattr(self.settings, "upstream_pool_timeout_seconds", 10.0),
+            write_timeout=getattr(self.settings, "upstream_write_timeout_seconds", 30.0),
             user_agent=self.settings.upstream_user_agent,
             proxy_url=self.settings.egress_proxy_url(),
             retry_backoff_base=self.settings.retry_backoff_base_seconds,
@@ -185,8 +195,10 @@ class ProviderHub:
 
         Never silently sends a namespaced model to the wrong provider — that
         was a production footgun (e.g. groq/... routed to NIM → 404 cascade).
-        Raises RuntimeError when the owning provider has no active runtime so
-        FallbackExecutor can advance to the next chain model.
+        Raises ProviderCircuitOpen when the owning provider's circuit is open
+        (a SKIP — must not trip the breaker, D2) and ProviderNotConfigured
+        when the owning provider has no active runtime so FallbackExecutor
+        can advance to the next chain model.
         """
         pid, upstream_mid = split_provider_model(
             model_id, self.provider_ids, default_provider="nim"
@@ -200,7 +212,7 @@ class ProviderHub:
                 logger.warning("all active provider circuits open — force-allowing %s", pid)
                 self.circuit_breaker.force_allow(pid)
             else:
-                raise RuntimeError(
+                raise ProviderCircuitOpen(
                     f"provider '{pid}' circuit is open — skipping model '{model_id}'"
                 )
         rt = self.runtimes.get(pid)
@@ -210,8 +222,8 @@ class ProviderHub:
         # Config states — don't trip the circuit breaker (only HTTP/transport
         # failures should do that). FallbackExecutor will advance to next model.
         if rt is None or not rt.config.enabled:
-            raise RuntimeError(f"provider '{pid}' is not available for model '{model_id}'")
-        raise RuntimeError(f"provider '{pid}' has no API keys for model '{model_id}'")
+            raise ProviderNotConfigured(f"provider '{pid}' is not available for model '{model_id}'")
+        raise ProviderNotConfigured(f"provider '{pid}' has no API keys for model '{model_id}'")
 
     def namespace(self, provider_id: str, upstream_model_id: str) -> str:
         return namespace_model(provider_id, upstream_model_id)

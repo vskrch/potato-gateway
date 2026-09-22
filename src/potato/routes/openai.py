@@ -366,8 +366,11 @@ async def _prepare_routed(
 
     try:
         ctx = await guard.before_request(headers=request.headers, proxy_token=proxy_token, body=body)
-    except RateLimitedError as exc:
-        return JSONResponse(content=exc.response, status_code=429)
+    except RateLimitedError:
+        # D5c: re-raise so the caller maps this to 429. Returning a
+        # JSONResponse here made the caller unpack a 5-tuple from a Response
+        # → TypeError → 500.
+        raise
     # Auto-router session model pin (OpenRouter sticky model selection)
     preferred_model = getattr(ctx, "preferred_model", None)
 
@@ -860,6 +863,11 @@ async def _chat_like(
                             yield (b"data: " + _json.dumps(err_evt).encode("utf-8") + b"\n\n")
                             yield b"data: [DONE]\n\n"
                     finally:
+                        # D6b: deterministic cleanup — close the normalized
+                        # iterator (which closes robust_iter → upstream) before
+                        # releasing the concurrency gate.
+                        with suppress(Exception):
+                            await upstream_iter.aclose()
                         # Check if robust_iter detected a mid-stream failure
                         if result.stream_failed and not err:
                             err = "mid_stream_failure"
@@ -1009,11 +1017,18 @@ async def _chat_like(
 
         # Passthrough (routing disabled)
         if stream:
-            status, byte_iter, headers, key = await upstream.stream(
-                "POST",
-                upstream_path,
-                json_body=body,
-                preferred_key_id=preferred,
+            # D6c: bound passthrough by the request deadline like routed traffic.
+            import asyncio as _aio_pt
+
+            _pt_deadline = float(getattr(_settings(request), "request_deadline_seconds", 300.0) or 300.0)
+            status, byte_iter, headers, key = await _aio_pt.wait_for(
+                upstream.stream(
+                    "POST",
+                    upstream_path,
+                    json_body=body,
+                    preferred_key_id=preferred,
+                ),
+                timeout=max(1.0, _pt_deadline),
             )
             media = headers.get("content-type", "text/event-stream")
             key_id = key.key_id
@@ -1049,6 +1064,9 @@ async def _chat_like(
                         yield (b"data: " + _json.dumps(err_evt).encode("utf-8") + b"\n\n")
                         yield b"data: [DONE]\n\n"
                 finally:
+                    # D6b: close the upstream iterator on early exit.
+                    with suppress(Exception):
+                        await byte_iter.aclose()
                     await guard.after_request(ctx, key_id=key_id, success=ok and not err)
                     status_final = status if not err else 499
                     _finish_log(
@@ -1083,11 +1101,18 @@ async def _chat_like(
                 },
             )
 
-        status, resp_body, headers, key = await upstream.request_json(
-            "POST",
-            upstream_path,
-            json_body=body,
-            preferred_key_id=preferred,
+        # D6c: bound passthrough by the request deadline like routed traffic.
+        import asyncio as _aio_ptj
+
+        _ptj_deadline = float(getattr(_settings(request), "request_deadline_seconds", 300.0) or 300.0)
+        status, resp_body, headers, key = await _aio_ptj.wait_for(
+            upstream.request_json(
+                "POST",
+                upstream_path,
+                json_body=body,
+                preferred_key_id=preferred,
+            ),
+            timeout=max(1.0, _ptj_deadline),
         )
         await guard.after_request(ctx, key_id=key.key_id, success=200 <= status < 300)
         pt = ct = cached = 0

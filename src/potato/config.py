@@ -45,8 +45,15 @@ class Settings(BaseSettings):
     # Violating these guarantees a 504 cascade
     upstream_timeout: float = 300.0
     upstream_connect_timeout_seconds: float = 5.0
+    upstream_pool_timeout_seconds: float = 10.0
+    upstream_write_timeout_seconds: float = 30.0
     enable_ttft_hedging: bool = True
     ttft_hedge_factor: float = 1.8
+    # P2-1: true parallel TTFT hedging (race primary vs secondary, first
+    # content-bearing delta wins). Default off — canary before enabling.
+    enable_parallel_hedge: bool = False
+    parallel_hedge_delay_seconds: float = 2.5
+    parallel_hedge_max_per_request: int = 1
     allow_graceful_fallback_on_explicit: bool = False
     default_model: str | None = None
     # Streaming: short TTFT = fail-fast to next model if not responding;
