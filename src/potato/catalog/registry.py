@@ -264,7 +264,20 @@ class ModelRegistry:
         return n in self.catalog.aliases
 
     def resolve_alias(self, name: str) -> AliasTarget:
-        raw = self.catalog.aliases[normalize_model_name(name)]
+        current = normalize_model_name(name)
+        seen: set[str] = set()
+        while current in self.catalog.aliases and current not in seen and len(seen) < 10:
+            seen.add(current)
+            raw = self.catalog.aliases[current]
+            target = parse_alias_value(raw)
+            if target.kind == "chain":
+                return target
+            next_name = normalize_model_name(target.value)
+            if next_name in self.catalog.aliases and next_name not in seen:
+                current = next_name
+            else:
+                return target
+        raw = self.catalog.aliases.get(current, name)
         return parse_alias_value(raw)
 
     def is_known(self, model_id: str) -> bool:

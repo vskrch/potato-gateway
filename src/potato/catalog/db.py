@@ -91,11 +91,13 @@ class PotatoDB:
             str(self.path),
             check_same_thread=False,
             isolation_level=None,  # autocommit; we use explicit BEGIN
+            timeout=15.0,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=15000")
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._migrate_provider_filter_columns()

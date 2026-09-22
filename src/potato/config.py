@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     request_file_logging: bool = True
     request_log_max_bytes: int = 50 * 1024 * 1024  # 50 MiB per rotated file
     request_log_retention_days: int = 90  # ~3 months on disk
+    max_request_body_bytes: int = 50 * 1024 * 1024  # 50 MiB max payload (DoS protection)
     # Adaptive: always prefer currently responding models at request time
     adaptive_routing: bool = True
 

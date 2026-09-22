@@ -647,6 +647,23 @@ async def _chat_like(
     )
     upstream = _upstream(request)
     guard: AccountGuard = request.app.state.guard
+
+    settings = _settings(request)
+    max_body = getattr(settings, "max_request_body_bytes", 50 * 1024 * 1024)
+    cl_hdr = request.headers.get("content-length")
+    if cl_hdr and cl_hdr.isdigit() and int(cl_hdr) > max_body:
+        _finish_log(entry, status=413, t0=t0, error="payload_too_large")
+        return JSONResponse(
+            {
+                "error": {
+                    "message": f"Request payload exceeds maximum allowed size ({max_body} bytes)",
+                    "type": "invalid_request_error",
+                    "code": "payload_too_large",
+                }
+            },
+            status_code=413,
+        )
+
     try:
         body = await request.json()
         if not isinstance(body, dict):

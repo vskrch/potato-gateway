@@ -166,6 +166,41 @@ def sanitize_chat_body(body: dict[str, Any]) -> dict[str, Any]:
     if n not in (None, 1):
         raise ValueError("n_not_supported")
 
+    # Filter invalid / None messages from messages array
+    msgs = out.get("messages")
+    if msgs is not None:
+        if isinstance(msgs, list):
+            out["messages"] = [m for m in msgs if isinstance(m, dict)]
+        else:
+            out["messages"] = []
+
+    # max_tokens normalization: cast numeric strings, drop non-positive values
+    mt = out.get("max_tokens")
+    if isinstance(mt, str) and mt.isdigit():
+        out["max_tokens"] = int(mt)
+    elif isinstance(mt, (int, float)) and mt <= 0:
+        out.pop("max_tokens", None)
+
+    # temperature normalization: cast string, clamp negative to 0.0
+    temp = out.get("temperature")
+    if isinstance(temp, str):
+        try:
+            out["temperature"] = float(temp)
+        except ValueError:
+            out.pop("temperature", None)
+    if isinstance(out.get("temperature"), (int, float)) and out["temperature"] < 0:
+        out["temperature"] = 0.0
+
+    # top_p normalization: cast string, clamp to [0.0, 1.0]
+    top_p = out.get("top_p")
+    if isinstance(top_p, str):
+        try:
+            out["top_p"] = float(top_p)
+        except ValueError:
+            out.pop("top_p", None)
+    if isinstance(out.get("top_p"), (int, float)):
+        out["top_p"] = max(0.0, min(1.0, float(out["top_p"])))
+
     # Empty tools → drop (some providers 400)
     tools = out.get("tools")
     if tools is not None and not tools:

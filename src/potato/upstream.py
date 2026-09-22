@@ -27,17 +27,20 @@ class KeyPoolExhausted(RuntimeError):
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """Parse Retry-After header to seconds."""
+    """Parse Retry-After header to seconds, bounded by a 300s sanity ceiling."""
     if not value:
         return None
     value = value.strip()
+    MAX_RETRY_AFTER = 300.0
     try:
-        return max(0.0, float(value))
+        sec = max(0.0, float(value))
+        return min(sec, MAX_RETRY_AFTER)
     except ValueError:
         pass
     try:
         dt = parsedate_to_datetime(value)
-        return max(0.0, dt.timestamp() - time.time())
+        sec = max(0.0, dt.timestamp() - time.time())
+        return min(sec, MAX_RETRY_AFTER)
     except (TypeError, ValueError, OverflowError):
         return None
 
@@ -366,7 +369,7 @@ class UpstreamClient:
                     await resp.aclose()
                     await self.pool.release(key, success=False, status_code=resp.status_code)
                     released = True
-                    if attempt < max_retries - 1:
+                    if attempt < max_retries - 1 and len(self.pool) > 1:
                         continue
 
                     from potato.compat import frame_sse_error

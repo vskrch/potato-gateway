@@ -221,7 +221,7 @@ class KeyPool:
                 stats.error_count += 1
                 cooldown = self.cooldown_seconds
                 if retry_after_seconds is not None and retry_after_seconds > 0:
-                    cooldown = max(cooldown, retry_after_seconds)
+                    cooldown = max(cooldown, min(retry_after_seconds, 300.0))
                 stats.cooldown_until = max(stats.cooldown_until, time.monotonic() + cooldown)
                 logger.warning(
                     "%s hit rate limit; cooling down %.0fs",

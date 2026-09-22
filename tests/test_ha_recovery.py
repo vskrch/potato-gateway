@@ -10,7 +10,7 @@ import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -982,4 +982,130 @@ async def test_plain_string_400_retryable_error_advances_fallback() -> None:
     assert res.status_code == 200
     assert calls == ["model-a", "model-b"]
     assert res.body["choices"][0]["message"]["content"] == "rescued"
+
+
+# ── T27: Edge Case — Circular Alias Resolution Safety ──
+
+
+def test_circular_alias_resolution_does_not_loop() -> None:
+    """Circular aliases (e.g. a -> b -> a) must not recurse or loop infinitely."""
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.catalog.aliases["loop-a"] = "loop-b"
+    reg.catalog.aliases["loop-b"] = "loop-a"
+
+    target = reg.resolve_alias("loop-a")
+    assert target.kind == "model"
+    assert target.value in {"loop-a", "loop-b"}
+
+
+# ── T28: Edge Case — Multi-hop Alias Resolution ──
+
+
+def test_multi_hop_alias_resolution() -> None:
+    """Multi-hop aliases (fast -> haiku -> anthropic/claude-3-haiku) must resolve to final target."""
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.catalog.aliases["fast-step1"] = "fast-step2"
+    reg.catalog.aliases["fast-step2"] = "model-final"
+
+    target = reg.resolve_alias("fast-step1")
+    assert target.kind == "model"
+    assert target.value == "model-final"
+
+
+# ── T29: Edge Case — Oversized Payload HTTP 413 Rejection ──
+
+
+@pytest.mark.asyncio
+async def test_oversized_payload_returns_413() -> None:
+    """Requests exceeding max_request_body_bytes via Content-Length header must return HTTP 413."""
+    from starlette.requests import Request
+    from potato.routes.openai import _chat_like
+
+    async def fake_receive():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    app = MagicMock()
+    app.state.settings = Settings(max_request_body_bytes=1024)
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", b"100000000"),  # 100MB declared
+        ],
+        "state": {"request_id": "req-oversize"},
+    }
+    req = Request(scope, fake_receive)
+    req.app.state.guard = MagicMock()
+    req.app.state.upstream = AsyncMock()
+
+    resp = await _chat_like(req, upstream_path="/chat/completions")
+    assert resp.status_code == 413
+    import json
+    data = json.loads(resp.body.decode("utf-8"))
+    assert data["error"]["code"] == "payload_too_large"
+
+
+# ── T30: Edge Case — Chat Parameter Sanitization & Normalization ──
+
+
+def test_sanitize_chat_body_parameter_bounds() -> None:
+    """Invalid parameter values (negative temperature, out-of-bounds top_p, string max_tokens,
+    None messages) must be sanitized rather than crashing or being rejected by upstreams.
+    """
+    from potato.compat import sanitize_chat_body
+
+    body = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "hello"},
+            None,  # malformed message entry
+            "invalid-string-message",
+        ],
+        "max_tokens": "512",  # numeric string
+        "temperature": "-0.5",  # negative string
+        "top_p": "1.5",  # > 1.0 string
+    }
+    cleaned = sanitize_chat_body(body)
+
+    # None / non-dict entries filtered
+    assert len(cleaned["messages"]) == 1
+    assert cleaned["messages"][0]["content"] == "hello"
+
+    # max_tokens converted to int
+    assert cleaned["max_tokens"] == 512
+
+    # temperature clamped to 0.0
+    assert cleaned["temperature"] == 0.0
+
+    # top_p clamped to 1.0
+    assert cleaned["top_p"] == 1.0
+
+
+# ── T31: Edge Case — KeyPool Sanity Ceiling on Rogue Retry-After ──
+
+
+@pytest.mark.asyncio
+async def test_keypool_release_caps_rogue_retry_after() -> None:
+    """When an upstream 429 sends Retry-After: 86400 (24h), KeyPool.release must cap the
+    cooldown to 300s so the key is not disabled for a full day.
+    """
+    from potato.balancer import KeyPool
+
+    pool = KeyPool(api_keys=["key-a"], cooldown_seconds=60.0)
+    key = pool._keys[0]
+
+    await pool.release(
+        key,
+        success=False,
+        rate_limited=True,
+        status_code=429,
+        retry_after_seconds=86400.0,  # 24 hours rogue header
+    )
+
+    remaining = key.cooldown_until - time.monotonic()
+    assert remaining <= 305.0  # capped at 300s, not 86400s
+
 
