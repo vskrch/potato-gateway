@@ -121,6 +121,7 @@ class ProviderHub:
             base_url=cfg.base_url or self.settings.nim_base_url,
             pool=pool,
             timeout=self.settings.upstream_timeout,
+            connect_timeout=getattr(self.settings, "upstream_connect_timeout_seconds", 5.0),
             user_agent=self.settings.upstream_user_agent,
             proxy_url=self.settings.egress_proxy_url(),
             retry_backoff_base=self.settings.retry_backoff_base_seconds,
@@ -192,10 +193,11 @@ class ProviderHub:
         )
         # Circuit breaker: skip providers in open state (NMK-401)
         if not self.circuit_breaker.allow(pid):
-            # Last resort: if ALL providers are open, force-allow this one
+            # Last resort: if ALL active providers are open, force-allow this one
             # (better to try and fail than to not try at all)
-            if not self.circuit_breaker.any_closed(self.provider_ids):
-                logger.warning("all provider circuits open — force-allowing %s", pid)
+            active_pids = self.active_provider_ids() or self.provider_ids
+            if not self.circuit_breaker.any_closed(active_pids):
+                logger.warning("all active provider circuits open — force-allowing %s", pid)
                 self.circuit_breaker.force_allow(pid)
             else:
                 raise RuntimeError(

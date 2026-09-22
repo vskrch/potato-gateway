@@ -496,8 +496,8 @@ class ModelSelector:
         if chain and max_n and len(chain) > max_n:
             chain = chain[:max_n]
 
-        # Hard guarantee for auto: never return empty when the live pool has models
-        if not chain:
+        # Hard guarantee for auto: never return empty when the live pool or catalog has models
+        if not chain and not free_only:
             chain = build_intent_aware_pool(
                 self.registry,
                 primary_intent=intent_key,
@@ -511,15 +511,22 @@ class ModelSelector:
                 allowed_models=opts.allowed_models or None,
                 free_only=free_only,
             )
+            if not chain:
+                # Fallback step 1: Intent ladder from catalog
+                chain = self.registry.chain_for_intent(intent_key, variant=variant)
             if not chain and not opts.allowed_models and not free_only:
-                # Absolute last resort — any active model, no free/allowed constraints
-                # ponytail: unreachable — when live_ids is empty, _filter_available
-                # fail-opens to the static YAML chain, so the finalized chain is
-                # never empty here. Kept as a defensive guarantee against future
-                # changes to _filter_available.
-                try:  # pragma: no cover
-                    chain = sorted(self.registry.active_live_ids())[:max_n]
-                except Exception:  # pragma: no cover
+                # Fallback step 2: Any active live ID
+                try:
+                    active = self.registry.active_live_ids()
+                    if active:
+                        chain = sorted(active)[:max_n]
+                except Exception:
+                    pass
+            if not chain and not opts.allowed_models and not free_only:
+                # Fallback step 3: Any model in catalog
+                try:
+                    chain = [m.id for m in self.registry.catalog.models[:max_n]]
+                except Exception:
                     chain = []
 
         return RouteDecision(

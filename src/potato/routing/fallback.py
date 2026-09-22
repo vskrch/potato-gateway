@@ -414,19 +414,30 @@ class FallbackExecutor:
         except Exception:
             return None
 
-    def _circuit_fail(self, provider_id: str | None) -> None:
+    def _circuit_fail(
+        self,
+        provider_id: str | None,
+        *,
+        is_transport: bool = True,
+        model_id: str | None = None,
+    ) -> None:
         if not provider_id or self.hub is None:
             return
         cb = getattr(self.hub, "circuit_breaker", None)
         if cb is not None:
-            cb.fail(provider_id)
+            cb.fail(provider_id, is_transport=is_transport, model_id=model_id)
 
-    def _circuit_succeed(self, provider_id: str | None) -> None:
+    def _circuit_succeed(
+        self,
+        provider_id: str | None,
+        *,
+        model_id: str | None = None,
+    ) -> None:
         if not provider_id or self.hub is None:
             return
         cb = getattr(self.hub, "circuit_breaker", None)
         if cb is not None:
-            cb.succeed(provider_id)
+            cb.succeed(provider_id, model_id=model_id)
 
     def _make_upstream_span(
         self,
@@ -813,7 +824,7 @@ class FallbackExecutor:
         if str(decision.rule_id or "").startswith("custom_ladder:"):
             return False
         mode = str(decision.mode or "")
-        if mode in {"auto", "unknown_alias_as_auto"}:
+        if mode in {"auto", "unknown_alias_as_auto", "alias"}:
             return True
         if getattr(decision, "auto_tier", None):
             return True
@@ -1847,7 +1858,10 @@ class FallbackExecutor:
             # When the intent-aware chain and fresh retries are exhausted,
             # cast the widest net: every live model whose provider has a
             # runtime. Better to serve with a "wrong-intent" model than 503.
-            if last.status_code >= 400 and self._is_auto_decision(decision):
+            can_graceful = self._is_auto_decision(decision) or getattr(
+                self.settings, "allow_graceful_fallback_on_explicit", False
+            )
+            if last.status_code >= 400 and can_graceful:
                 remaining = deadline - time.monotonic()
                 if remaining >= 3.0 and attempts < max_attempts:
                     try:
@@ -2143,10 +2157,18 @@ class FallbackExecutor:
                 if h is not None and h.ewma_latency > 0:
                     base_ttft = h.ewma_latency * 2.0 + 3.0
                     ttft = min(ttft, max(3.0, base_ttft))
+                # TTFT Speculative Hedging: fail fast to next candidate on tail latency
+                is_last_model = idx == len(chain) - 1
+                if getattr(self.settings, "enable_ttft_hedging", True) and not is_last_model:
+                    hedge_factor = float(getattr(self.settings, "ttft_hedge_factor", 1.8))
+                    base_hedge = (h.ewma_latency if h and h.ewma_latency > 0 else 2.0) * hedge_factor
+                    effective_ttft = min(ttft, max(3.5, base_hedge))
+                else:
+                    effective_ttft = ttft
                 idle = float(getattr(self.settings, "stream_idle_timeout_seconds", 300.0) or 300.0)
                 t_stream0 = time.monotonic()
                 try:
-                    first_chunk = await asyncio.wait_for(anext(byte_iter), timeout=ttft)
+                    first_chunk = await asyncio.wait_for(anext(byte_iter), timeout=effective_ttft)
                 except StopAsyncIteration:
                     # Empty stream body — treat as soft-fail and try next model
                     first_chunk = b""
@@ -2532,32 +2554,43 @@ class FallbackExecutor:
                 unavailable=status == 404,
                 intent=decision.intent.value,
             )
-            if retryable and idx < len(chain) - 1:
-                # 504 = gateway timeout — advance immediately, no backoff
-                if status == 504:
-                    pass  # no backoff — advance immediately
-                elif status == 429:
-                    ra = parse_retry_after(headers.get("Retry-After") or headers.get("retry-after"))
-                    await sleep_backoff(
-                        idx,
-                        base=self.settings.retry_backoff_base_seconds,
-                        cap=self.settings.retry_backoff_cap_seconds,
-                        retry_after=ra,
+            if retryable:
+                if idx < len(chain) - 1:
+                    # 504 = gateway timeout — advance immediately, no backoff
+                    if status == 504:
+                        pass  # no backoff — advance immediately
+                    elif status == 429:
+                        ra = parse_retry_after(headers.get("Retry-After") or headers.get("retry-after"))
+                        await sleep_backoff(
+                            idx,
+                            base=self.settings.retry_backoff_base_seconds,
+                            cap=self.settings.retry_backoff_cap_seconds,
+                            retry_after=ra,
+                        )
+                    elif status in {500, 502, 503}:
+                        await sleep_backoff(
+                            idx,
+                            base=self.settings.retry_backoff_base_seconds,
+                            cap=min(1.0, self.settings.retry_backoff_cap_seconds),
+                        )
+                    self.stats.fallback_advances += 1
+                    logger.info(
+                        "stream model %s failed status=%s; falling back",
+                        model,
+                        status,
                     )
-                elif status in {500, 502, 503}:
-                    await sleep_backoff(
-                        idx,
-                        base=self.settings.retry_backoff_base_seconds,
-                        cap=min(1.0, self.settings.retry_backoff_cap_seconds),
-                    )
+                    continue
+                # Chain exhausted with retryable error: fall through to recovery and graceful fallback!
                 self.stats.fallback_advances += 1
-                logger.info(
-                    "stream model %s failed status=%s; falling back",
+                logger.warning(
+                    "stream chain exhausted on model %s status=%s; advancing to recovery and graceful fallback",
                     model,
                     status,
                 )
-                continue
+                last_status, last_model, last_pid, last_key = status, model, pid, key
+                break
 
+            # Non-retryable error (e.g. 400 client syntax error): return immediately
             async def err_bytes(payload: bytes = err_raw) -> AsyncIterator[bytes]:
                 yield payload
 
@@ -2963,10 +2996,13 @@ class FallbackExecutor:
         # runtime. Better to serve with a "wrong-intent" model than 503.
         # Auto decisions only — explicit model requests are never served by
         # a different model — and hard constraints (allowed/free) preserved.
+        can_graceful_stream = self._is_auto_decision(decision) or getattr(
+            self.settings, "allow_graceful_fallback_on_explicit", False
+        )
         if (
             last_status >= 400
             and not saw_deadline
-            and self._is_auto_decision(decision)
+            and can_graceful_stream
         ):
             remaining = deadline - time.monotonic()
             if remaining >= 3.0 and attempts < max_attempts:

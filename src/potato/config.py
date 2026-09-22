@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     # INVARIANT: request_deadline_seconds >= upstream_timeout
     # Violating these guarantees a 504 cascade
     upstream_timeout: float = 300.0
+    upstream_connect_timeout_seconds: float = 5.0
+    enable_ttft_hedging: bool = True
+    ttft_hedge_factor: float = 1.8
+    allow_graceful_fallback_on_explicit: bool = False
     default_model: str | None = None
     # Streaming: short TTFT = fail-fast to next model if not responding;
     # long idle once first token arrives (Cursor/agent safe).

@@ -25,7 +25,7 @@ class ProviderCircuitBreaker:
 
     def __init__(
         self,
-        failure_threshold: int = 3,
+        failure_threshold: int = 6,
         recovery_timeout: float = 15.0,
         cooldown_multiplier: float = 2.0,
     ) -> None:
@@ -36,6 +36,21 @@ class ProviderCircuitBreaker:
         self._failures: dict[str, int] = {}
         self._open_until: dict[str, float] = {}
         self._last_probe: dict[str, float] = {}
+        self._model_cooldowns: dict[str, float] = {}
+
+    def is_model_on_cooldown(self, model_id: str) -> bool:
+        """True if model is temporarily in cooldown."""
+        until = self._model_cooldowns.get(model_id.lower(), 0.0)
+        return time.monotonic() < until
+
+    def model_fail(self, model_id: str, cooldown_seconds: float = 60.0) -> None:
+        """Place an individual model on cooldown without penalizing the provider."""
+        self._model_cooldowns[model_id.lower()] = time.monotonic() + cooldown_seconds
+        logger.warning("model %s placed on cooldown for %.0fs", model_id, cooldown_seconds)
+
+    def model_succeed(self, model_id: str) -> None:
+        """Clear model cooldown on success."""
+        self._model_cooldowns.pop(model_id.lower(), None)
 
     def allow(self, provider_id: str) -> bool:
         """True if a request may be sent to this provider."""
@@ -86,8 +101,26 @@ class ProviderCircuitBreaker:
         self._failures[pid] = 0
         self._open_until.pop(pid, None)
 
-    def fail(self, provider_id: str) -> None:
-        """Record a failure from this provider."""
+    def fail(
+        self,
+        provider_id: str,
+        *,
+        is_transport: bool = True,
+        model_id: str | None = None,
+    ) -> None:
+        """Record a failure from this provider or model.
+        
+        Model-specific errors (404, 400, 429) place only that model on cooldown.
+        Only transport/connectivity failures (502, 503, 504, connect timeout)
+        penalize the provider circuit breaker.
+        """
+        if model_id and not is_transport:
+            self.model_fail(model_id)
+            return
+
+        if not is_transport:
+            return
+
         pid = provider_id.lower()
         self._failures[pid] = self._failures.get(pid, 0) + 1
         f = self._failures[pid]
@@ -117,8 +150,10 @@ class ProviderCircuitBreaker:
                 f,
             )
 
-    def succeed(self, provider_id: str) -> None:
+    def succeed(self, provider_id: str, *, model_id: str | None = None) -> None:
         """Record a success → close the circuit."""
+        if model_id:
+            self.model_succeed(model_id)
         pid = provider_id.lower()
         self._state[pid] = BreakerState.CLOSED
         self._failures[pid] = 0

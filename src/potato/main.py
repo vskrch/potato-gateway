@@ -299,6 +299,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 base_url=settings.nim_base_url,
                 pool=pool,
                 timeout=settings.upstream_timeout,
+                connect_timeout=getattr(settings, "upstream_connect_timeout_seconds", 5.0),
                 user_agent=settings.upstream_user_agent,
                 proxy_url=settings.egress_proxy_url(),
                 retry_backoff_base=settings.retry_backoff_base_seconds,

@@ -40,6 +40,7 @@ class UpstreamClient:
         pool: KeyPool,
         timeout: float = 300.0,
         *,
+        connect_timeout: float = 5.0,
         user_agent: str | None = None,
         proxy_url: str | None = None,
         retry_backoff_base: float = 0.5,
@@ -48,6 +49,7 @@ class UpstreamClient:
         self.base_url = base_url.rstrip("/")
         self.pool = pool
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.user_agent = user_agent
         self.proxy_url = proxy_url
         self.retry_backoff_base = retry_backoff_base
@@ -57,7 +59,7 @@ class UpstreamClient:
     async def start(self) -> None:
         kwargs: dict[str, Any] = {
             "base_url": self.base_url,
-            "timeout": httpx.Timeout(self.timeout, connect=2.0),
+            "timeout": httpx.Timeout(self.timeout, connect=self.connect_timeout),
             "follow_redirects": True,
             "limits": httpx.Limits(
                 max_connections=200,
