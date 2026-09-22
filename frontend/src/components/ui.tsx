@@ -73,6 +73,7 @@ export function StatBox({
   color,
   icon: Icon,
   trend,
+  accent = 'violet',
 }: {
   label: string
   value: string | number
@@ -80,33 +81,104 @@ export function StatBox({
   color?: string
   icon?: React.ComponentType<{ className?: string }>
   trend?: { value: string; positive?: boolean }
+  accent?: 'violet' | 'emerald' | 'amber' | 'cyan' | 'rose'
 }) {
+  const accentGradients = {
+    violet: 'from-violet-500/80 via-fuchsia-500/40 to-transparent',
+    emerald: 'from-emerald-500/80 via-teal-500/40 to-transparent',
+    amber: 'from-amber-500/80 via-orange-500/40 to-transparent',
+    cyan: 'from-cyan-500/80 via-blue-500/40 to-transparent',
+    rose: 'from-rose-500/80 via-pink-500/40 to-transparent',
+  }
+
+  const iconGlows = {
+    violet: 'group-hover:text-violet-300 group-hover:bg-violet-500/15 group-hover:border-violet-500/30',
+    emerald: 'group-hover:text-emerald-300 group-hover:bg-emerald-500/15 group-hover:border-emerald-500/30',
+    amber: 'group-hover:text-amber-300 group-hover:bg-amber-500/15 group-hover:border-amber-500/30',
+    cyan: 'group-hover:text-cyan-300 group-hover:bg-cyan-500/15 group-hover:border-cyan-500/30',
+    rose: 'group-hover:text-rose-300 group-hover:bg-rose-500/15 group-hover:border-rose-500/30',
+  }
+
   return (
-    <ShadCard className="p-5 flex flex-col justify-between relative overflow-hidden group hover:border-white/[0.15] transition-all duration-200 shadow-[0_4px_20px_rgba(0,0,0,0.2)]">
-      <div className="absolute -top-12 -right-12 w-28 h-28 bg-gradient-to-br from-violet-500/10 via-fuchsia-500/5 to-transparent rounded-full blur-2xl group-hover:scale-125 transition-transform duration-500 pointer-events-none" />
-      <div className="flex items-center justify-between gap-2 mb-3">
+    <ShadCard className="p-5 flex flex-col justify-between relative overflow-hidden group hover:border-white/[0.18] transition-all duration-300 shadow-[0_4px_24px_rgba(0,0,0,0.3)] hover:shadow-[0_8px_32px_rgba(0,0,0,0.4)] hover:-translate-y-0.5">
+      {/* Top ambient accent glow bar */}
+      <div className={cn('absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r opacity-60 group-hover:opacity-100 transition-opacity', accentGradients[accent])} />
+      
+      {/* Background ambient radial blur */}
+      <div className="absolute -top-12 -right-12 w-32 h-32 bg-gradient-to-br from-violet-500/10 via-fuchsia-500/5 to-transparent rounded-full blur-2xl group-hover:scale-150 transition-transform duration-500 pointer-events-none" />
+
+      <div className="flex items-center justify-between gap-2 mb-3 relative z-10">
         <span className="text-[11px] text-zinc-400 uppercase tracking-wider font-semibold">{label}</span>
         {Icon && (
-          <div className="p-2 rounded-xl bg-white/[0.04] border border-white/[0.06] text-zinc-400 group-hover:text-violet-400 group-hover:bg-violet-500/10 transition-colors">
+          <div className={cn('p-2 rounded-xl bg-white/[0.04] border border-white/[0.07] text-zinc-400 transition-all duration-200', iconGlows[accent])}>
             <Icon className="w-4 h-4" />
           </div>
         )}
       </div>
-      <div className="flex items-baseline justify-between gap-2">
-        <span className={cn('text-2xl font-bold tracking-tight', color || 'text-white')}>{value}</span>
+
+      <div className="flex items-baseline justify-between gap-2 relative z-10">
+        <span className={cn('text-2xl font-bold tracking-tight font-mono', color || 'text-white')}>{value}</span>
         {trend && (
           <span
             className={cn(
-              'text-xs font-semibold px-2 py-0.5 rounded-md',
-              trend.positive ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400',
+              'text-xs font-semibold px-2 py-0.5 rounded-md border font-mono',
+              trend.positive
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : 'bg-rose-500/10 text-rose-400 border-rose-500/20',
             )}
           >
             {trend.value}
           </span>
         )}
       </div>
-      {sub && <span className="text-xs text-zinc-400 mt-2 font-medium">{sub}</span>}
+
+      {sub && <span className="text-xs text-zinc-400 mt-2 font-medium relative z-10">{sub}</span>}
     </ShadCard>
+  )
+}
+
+export function QuickCopyPill({ text, label }: { text: string; label?: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    navigator.clipboard.writeText(text)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1200)
+  }
+  return (
+    <button
+      onClick={copy}
+      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-zinc-900/80 hover:bg-zinc-800 border border-white/[0.08] hover:border-violet-500/30 text-xs text-zinc-300 font-mono transition-all group"
+      title="Click to copy"
+    >
+      {label && <span className="text-zinc-400 font-sans text-[11px]">{label}:</span>}
+      <span className="text-violet-300 group-hover:text-white transition-colors">{text}</span>
+      {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3 text-zinc-500 group-hover:text-zinc-300" />}
+    </button>
+  )
+}
+
+export function ResilienceBadge({
+  status = 'operational',
+  sla = '99.99%',
+}: {
+  status?: 'operational' | 'degraded' | 'recovering'
+  sla?: string
+}) {
+  const isOk = status === 'operational'
+  return (
+    <div className={cn(
+      'inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-mono transition-all',
+      isOk
+        ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.12)]'
+        : 'bg-amber-500/10 border-amber-500/25 text-amber-300'
+    )}>
+      <span className="relative flex h-2 w-2">
+        {isOk && <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />}
+        <span className={cn('relative inline-flex rounded-full h-2 w-2', isOk ? 'bg-emerald-500' : 'bg-amber-500')} />
+      </span>
+      <span className="font-semibold text-white tracking-wide">SLA {sla}</span>
+      <span className="text-[10px] text-zinc-400 uppercase">Resilience Active</span>
+    </div>
   )
 }
 

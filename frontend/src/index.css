@@ -68,7 +68,11 @@ html {
 
 body {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  background: #09090b;
+  background-color: #070709;
+  background-image:
+    radial-gradient(1200px circle at 50% -12%, rgba(139, 92, 246, 0.15), transparent 70%),
+    radial-gradient(900px circle at 100% 100%, rgba(16, 185, 129, 0.05), transparent 60%);
+  background-attachment: fixed;
   color: #fafafa;
   height: 100vh;
   height: 100dvh; /* dynamic viewport height — handles mobile URL bar */
@@ -86,7 +90,7 @@ body {
 :focus-visible {
   outline: 2px solid #8b5cf6;
   outline-offset: 2px;
-  border-radius: 4px;
+  border-radius: 6px;
 }
 /* Remove default outline only when focus-visible is supported */
 :focus:not(:focus-visible) {
@@ -96,16 +100,62 @@ body {
 /* Scrollbars — cross-browser (webkit + Firefox) */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255,255,255,0.15) transparent;
+  scrollbar-color: rgba(255,255,255,0.18) transparent;
 }
-::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.15); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
 
 /* Tap targets: prevent iOS double-tap zoom on buttons (a11y + UX) */
 button, [role="button"], a {
   touch-action: manipulation;
+}
+
+/* Glassmorphic luxury utilities */
+.glass-panel {
+  background: rgba(14, 14, 18, 0.65);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.glass-panel-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.glass-panel-hover:hover {
+  background: rgba(19, 19, 26, 0.8);
+  border-color: rgba(139, 92, 246, 0.28);
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5), 0 0 20px -5px rgba(139, 92, 246, 0.12);
+}
+
+.glow-edge-violet {
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.1), 0 0 20px -5px rgba(139, 92, 246, 0.25);
+}
+
+.glow-edge-emerald {
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.1), 0 0 20px -5px rgba(16, 185, 129, 0.25);
+}
+
+/* Sub-pixel subtle grid background */
+.bg-grid-subtle {
+  background-size: 32px 32px;
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+}
+
+/* Text Gradients */
+.text-gradient-purple {
+  background: linear-gradient(135deg, #ffffff 30%, #c4b5fd 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.text-gradient-emerald {
+  background: linear-gradient(135deg, #ffffff 40%, #6ee7b7 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 /* Respect reduced-motion preferences (WCAG 2.3.3) */
@@ -126,5 +176,5 @@ button, [role="button"], a {
 /* custom-scrollbar helper used across pages — keep as a utility class */
 .custom-scrollbar {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255,255,255,0.15) transparent;
+  scrollbar-color: rgba(255,255,255,0.18) transparent;
 }

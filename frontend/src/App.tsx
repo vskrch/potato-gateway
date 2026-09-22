@@ -2,11 +2,12 @@ import React, { useState, useCallback, useEffect, Suspense } from 'react'
 import Sidebar from './components/Sidebar'
 import AuthModal, { type AuthSession } from './components/AuthModal'
 import ErrorBoundary from './components/ErrorBoundary'
-import { Toast, Button, OfflineBanner, Toaster } from './components/ui'
+import { Toast, Button, OfflineBanner, Toaster, QuickCopyPill } from './components/ui'
+import CommandPalette from './components/CommandPalette'
 import { useAuth, useSSE } from './hooks/useApi'
 import { useToastQueue } from './hooks/useToast'
 import { api, ap } from './lib/api'
-import { RefreshCw, Radio, ShieldAlert, Menu } from 'lucide-react'
+import { RefreshCw, Radio, ShieldAlert, Menu, Search } from 'lucide-react'
 
 import DashboardPage from './pages/DashboardPage'
 import AnalyticsOverviewPage from './pages/AnalyticsOverviewPage'
@@ -53,8 +54,21 @@ export default function App() {
   const [page, setPage] = useState('dashboard')
   const [refreshing, setRefreshing] = useState(false)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+  const [cmdOpen, setCmdOpen] = useState(false)
   const sse = useSSE()
   const { toasts, show: showToast, dismiss } = useToastQueue()
+
+  // ⌘K global shortcut for Command Palette
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setCmdOpen(open => !open)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [])
 
   // ponytail: /chat path → full-screen chat (no sidebar). Dashboard nav sets page='chat'.
   useEffect(() => {
@@ -143,6 +157,8 @@ export default function App() {
         onLogout={logout}
         mobileOpen={mobileNavOpen}
         onMobileClose={() => setMobileNavOpen(false)}
+        onOpenCommandPalette={() => setCmdOpen(true)}
+        liveModelCount={sse?.live_models}
       />
 
       {/* Main Content Area */}
@@ -165,9 +181,23 @@ export default function App() {
             </div>
           </div>
 
+          {/* Center Quick Search & Jump */}
+          <div className="hidden md:flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => setCmdOpen(true)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-zinc-900/90 hover:bg-zinc-800/90 border border-white/[0.08] hover:border-violet-500/40 text-xs text-zinc-400 hover:text-zinc-200 transition-all shadow-inner group"
+            >
+              <Search className="w-3.5 h-3.5 text-zinc-500 group-hover:text-violet-400 transition-colors" />
+              <span className="font-medium">Quick search or jump...</span>
+              <kbd className="ml-2 font-mono text-[10px] bg-white/[0.06] border border-white/[0.1] px-1.5 py-0.5 rounded text-zinc-300">⌘K</kbd>
+            </button>
+            <QuickCopyPill text={`${window.location.origin}/v1`} label="Base URL" />
+          </div>
+
           <div className="flex items-center gap-2 sm:gap-4 shrink-0">
             {/* Live Connection Status Badge */}
-            <div className="flex items-center gap-2 px-2.5 sm:px-3 py-1.5 rounded-full bg-zinc-900 border border-white/[0.08] text-xs">
+            <div className="flex items-center gap-2 px-2.5 sm:px-3 py-1.5 rounded-full bg-zinc-900 border border-white/[0.08] text-xs shadow-inner">
               <span className={`w-2 h-2 rounded-full shrink-0 ${sse ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] animate-pulse' : 'bg-zinc-500'}`} />
               <span className="text-zinc-300 font-mono text-[11px] hidden sm:inline">
                 {sse ? (
@@ -235,6 +265,15 @@ export default function App() {
 
       {/* Modals & Toasts */}
       {showAuth && !authed && <AuthModal onSession={applySession} />}
+
+      {/* ⌘K Command Palette */}
+      <CommandPalette
+        open={cmdOpen}
+        onClose={() => setCmdOpen(false)}
+        onNavigate={handlePageChange}
+        isAdmin={isAdmin}
+        onRefreshCatalog={isAdmin ? handleRefreshAll : undefined}
+      />
 
       {toasts.map(t => (
         <Toast key={t.id} message={t.message} type={t.type} onDismiss={() => dismiss(t.id)} duration={t.duration} />
