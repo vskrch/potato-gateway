@@ -206,6 +206,7 @@ class UpstreamClient:
                         base=self.retry_backoff_base,
                         cap=self.retry_backoff_cap,
                         retry_after=retry_after,
+                        max_delay=self.retry_backoff_cap,
                     )
                     logger.info(
                         "upstream 429 on %s; backoff %.2fs then rotate key (attempt %s)",
@@ -334,6 +335,7 @@ class UpstreamClient:
                             base=self.retry_backoff_base,
                             cap=self.retry_backoff_cap,
                             retry_after=retry_after,
+                            max_delay=self.retry_backoff_cap,
                         )
                         logger.info(
                             "upstream stream 429 on %s; backoff %.2fs then rotate (attempt %s)",
@@ -441,6 +443,7 @@ class UpstreamClient:
                     attempt,
                     base=self.retry_backoff_base,
                     cap=self.retry_backoff_cap,
+                    max_delay=self.retry_backoff_cap,
                 )
                 logger.info(
                     "upstream stream transport error; backoff %.2fs (attempt %s)",

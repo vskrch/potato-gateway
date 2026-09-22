@@ -649,12 +649,14 @@ async def _chat_like(
     guard: AccountGuard = request.app.state.guard
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object")
     except Exception as exc:
         _finish_log(entry, status=400, t0=t0, error=f"invalid_json:{exc}")
         return JSONResponse(
             {
                 "error": {
-                    "message": "Invalid JSON body",
+                    "message": "Invalid JSON body: request body must be a JSON object",
                     "type": "invalid_request_error",
                     "code": "invalid_json",
                 }
@@ -830,6 +832,14 @@ async def _chat_like(
                     err: str | None = None
                     try:
                         async for chunk in upstream_iter:
+                            if await request.is_disconnected():
+                                logger.info(
+                                    "downstream client disconnected; aborting stream req=%s model=%s",
+                                    req_id,
+                                    result.model,
+                                )
+                                err = "client_disconnected"
+                                break
                             yield chunk
                     except Exception as stream_exc:
                         err = str(stream_exc)

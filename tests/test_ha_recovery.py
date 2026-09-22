@@ -748,3 +748,238 @@ async def test_robust_iter_suppresses_raw_upstream_error_chunk() -> None:
     assert b"potato-stream-error" in combined
     assert b"Midstream failure" in combined
     assert b"data: [DONE]" in combined
+
+
+# ── T19: Edge Case — Cloudflare 524 Gateway Timeout Advances Fallback ──
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_524_advances_fallback() -> None:
+    """When an upstream proxy returns HTTP 524 Gateway Timeout, the fallback engine
+    treats it as retryable and advances to the next model in the chain.
+    """
+    settings = Settings(nim_api_keys=["k"])
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-b"}
+
+    calls: list[str] = []
+
+    async def fake_request(method, path, *, json_body, **kwargs):
+        m = json_body.get("model")
+        calls.append(m)
+        if m == "model-a":
+            return 524, {"error": {"message": "A timeout occurred"}}, {}, _key()
+        return 200, {"id": "ok", "choices": [{"message": {"content": "recovered"}}]}, {}, _key()
+
+    upstream = AsyncMock()
+    upstream.request_json = fake_request
+    ex = FallbackExecutor(upstream, reg, settings)
+    ex._provider_available = lambda _m: True
+    ex._client_for = lambda m: (upstream, m)
+
+    decision = _auto(["model-a", "model-b"])
+    res = await ex.execute_json("/chat/completions", {"messages": []}, decision)
+
+    assert res.status_code == 200
+    assert calls == ["model-a", "model-b"]
+    assert res.body["choices"][0]["message"]["content"] == "recovered"
+
+
+# ── T20: Edge Case — HTTP 422 Context Length Overflow Advances Fallback ──
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_422_advances_fallback() -> None:
+    """When an upstream model returns HTTP 422 Unprocessable Entity with context overflow,
+    the router advances to the next candidate model rather than failing as a client error.
+    """
+    settings = Settings(nim_api_keys=["k"])
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-b"}
+
+    calls: list[str] = []
+
+    async def fake_request(method, path, *, json_body, **kwargs):
+        m = json_body.get("model")
+        calls.append(m)
+        if m == "model-a":
+            return 422, {"error": {"message": "prompt is too long: exceeds maximum context length of 8192"}}, {}, _key()
+        return 200, {"id": "ok", "choices": [{"message": {"content": "big-context-win"}}]}, {}, _key()
+
+    upstream = AsyncMock()
+    upstream.request_json = fake_request
+    ex = FallbackExecutor(upstream, reg, settings)
+    ex._provider_available = lambda _m: True
+    ex._client_for = lambda m: (upstream, m)
+
+    decision = _auto(["model-a", "model-b"])
+    res = await ex.execute_json("/chat/completions", {"messages": []}, decision)
+
+    assert res.status_code == 200
+    assert calls == ["model-a", "model-b"]
+    assert res.body["choices"][0]["message"]["content"] == "big-context-win"
+
+
+# ── T21: Edge Case — Rogue Retry-After Ceiling ──
+
+
+def test_backoff_sanity_cap_on_rogue_retry_after() -> None:
+    """Verify that a rogue or malicious Retry-After header (e.g. 86400s) is capped
+    at a reasonable sanity ceiling rather than freezing execution for 24 hours.
+    """
+    from potato.safety.backoff import compute_backoff_seconds
+
+    # Without max_delay, caps at max(cap, 60.0) = 60s
+    delay = compute_backoff_seconds(0, cap=16.0, retry_after=86400.0)
+    assert delay <= 75.0  # 60s + max 20% jitter = 72.0s
+
+    # With max_delay=16.0, caps at 16.0s
+    capped = compute_backoff_seconds(0, cap=16.0, retry_after=86400.0, max_delay=16.0)
+    assert capped <= 16.0
+
+
+# ── T22: Edge Case — Circuit Breaker Model Cooldown Eviction ──
+
+
+def test_circuit_breaker_model_cooldown_eviction() -> None:
+    """Verify that expired model cooldowns are automatically pruned to prevent memory leaks."""
+    cb = ProviderCircuitBreaker()
+    # Add an already expired cooldown
+    cb._model_cooldowns["expired-model"] = time.monotonic() - 10.0
+    cb._model_cooldowns["active-model"] = time.monotonic() + 100.0
+
+    # is_model_on_cooldown checks and prunes expired
+    assert not cb.is_model_on_cooldown("expired-model")
+    assert "expired-model" not in cb._model_cooldowns
+    assert cb.is_model_on_cooldown("active-model")
+
+
+# ── T23: Edge Case — Non-dict JSON Request Rejection (HTTP 400 vs 500) ──
+
+
+@pytest.mark.asyncio
+async def test_non_dict_json_request_returns_400() -> None:
+    """Sending a non-dict JSON body (e.g. a list [1, 2, 3]) must return 400 Bad Request,
+    not raise an unhandled 500 AttributeError on body.get().
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    from starlette.requests import Request
+    from potato.routes.openai import _chat_like
+
+    async def fake_receive():
+        return {
+            "type": "http.request",
+            "body": b"[1, 2, 3]",
+            "more_body": False,
+        }
+
+    app = MagicMock()
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [(b"content-type", b"application/json")],
+        "state": {"request_id": "req-test-non-dict"},
+    }
+    req = Request(scope, fake_receive)
+    # Mock minimal app.state
+    req.app.state.guard = MagicMock()
+    req.app.state.upstream = AsyncMock()
+
+    resp = await _chat_like(req, upstream_path="/chat/completions")
+    assert resp.status_code == 400
+    import json
+    data = json.loads(resp.body.decode("utf-8"))
+    assert data["error"]["code"] == "invalid_json"
+
+
+# ── T24: Edge Case — Claude SSE Stream Emits Anthropic Error Frame ──
+
+
+@pytest.mark.asyncio
+async def test_claude_sse_stream_translates_error_frame() -> None:
+    """When an upstream stream fails mid-stream with an error event, Claude SSE translation
+    must emit an Anthropic 'event: error' frame and not complete with end_turn.
+    """
+    from fastapi.responses import StreamingResponse
+    from potato.routes.claude import transform_openai_to_anthropic_sse_stream
+
+    async def fake_openai_chunks():
+        # First chunk: text
+        yield b'data: {"id":"1","choices":[{"delta":{"content":"Hi"}}]}\n\n'
+        # Second chunk: error event
+        yield b'data: {"error":{"message":"Mid-stream GPU collapse","type":"server_error"}}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    stream_resp = StreamingResponse(fake_openai_chunks())
+    events: list[str] = []
+    async for chunk in transform_openai_to_anthropic_sse_stream(stream_resp, "claude-3-5-sonnet"):
+        events.append(chunk.decode("utf-8"))
+
+    combined = "".join(events)
+    assert "event: error" in combined
+    assert "Mid-stream GPU collapse" in combined
+    assert "end_turn" not in combined
+
+
+# ── T25: Edge Case — Responses API SSE Translates Stream Error to response.failed ──
+
+
+@pytest.mark.asyncio
+async def test_responses_sse_translates_error_to_failed_event() -> None:
+    """When an upstream stream fails with an error or finish_reason=error, Responses API
+    must emit a 'response.failed' event frame instead of 'response.completed'.
+    """
+    from fastapi.responses import StreamingResponse
+    from potato.routes.responses import transform_chat_sse_to_responses_sse
+
+    async def fake_error_chunks():
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"error"}]}\n\n'
+        yield b'data: [DONE]\n\n'
+
+    stream_resp = StreamingResponse(fake_error_chunks())
+    events: list[str] = []
+    async for chunk in transform_chat_sse_to_responses_sse(stream_resp, "gpt-4o"):
+        events.append(chunk.decode("utf-8"))
+
+    combined = "".join(events)
+    assert "response.failed" in combined
+    assert "response.completed" not in combined
+
+
+# ── T26: Edge Case — Plain String HTTP 400 Retryable Error Advances Fallback ──
+
+
+@pytest.mark.asyncio
+async def test_plain_string_400_retryable_error_advances_fallback() -> None:
+    """When an upstream proxy returns a raw string HTTP 400 (e.g. 'Upstream request failed'),
+    the fallback executor advances rather than treating it as a non-retryable client error.
+    """
+    settings = Settings(nim_api_keys=["k"])
+    reg = ModelRegistry.from_yaml(YAML)
+    reg.live_ids = {"model-a", "model-b"}
+
+    calls: list[str] = []
+
+    async def fake_request(method, path, *, json_body, **kwargs):
+        m = json_body.get("model")
+        calls.append(m)
+        if m == "model-a":
+            # Plain string body from reverse proxy
+            return 400, "Bad Request: upstream request failed due to backend timeout", {}, _key()
+        return 200, {"id": "ok", "choices": [{"message": {"content": "rescued"}}]}, {}, _key()
+
+    upstream = AsyncMock()
+    upstream.request_json = fake_request
+    ex = FallbackExecutor(upstream, reg, settings)
+    ex._provider_available = lambda _m: True
+    ex._client_for = lambda m: (upstream, m)
+
+    decision = _auto(["model-a", "model-b"])
+    res = await ex.execute_json("/chat/completions", {"messages": []}, decision)
+
+    assert res.status_code == 200
+    assert calls == ["model-a", "model-b"]
+    assert res.body["choices"][0]["message"]["content"] == "rescued"
+

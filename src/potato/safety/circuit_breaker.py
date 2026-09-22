@@ -55,13 +55,26 @@ class ProviderCircuitBreaker:
 
     def is_model_on_cooldown(self, model_id: str) -> bool:
         """True if model is temporarily in cooldown."""
-        until = self._model_cooldowns.get(model_id.lower(), 0.0)
-        return time.monotonic() < until
+        mid = model_id.lower()
+        until = self._model_cooldowns.get(mid, 0.0)
+        now = time.monotonic()
+        if now >= until:
+            if mid in self._model_cooldowns:
+                self._model_cooldowns.pop(mid, None)
+            return False
+        return True
 
     def model_fail(self, model_id: str, cooldown_seconds: float = 60.0) -> None:
         """Place an individual model on cooldown without penalizing the provider."""
-        self._model_cooldowns[model_id.lower()] = time.monotonic() + cooldown_seconds
+        now = time.monotonic()
+        mid = model_id.lower()
+        self._model_cooldowns[mid] = now + cooldown_seconds
         logger.warning("model %s placed on cooldown for %.0fs", model_id, cooldown_seconds)
+        # Prune expired entries if cooldown tracking grows large
+        if len(self._model_cooldowns) > 200:
+            expired = [m for m, u in self._model_cooldowns.items() if now >= u]
+            for m in expired:
+                self._model_cooldowns.pop(m, None)
 
     def model_succeed(self, model_id: str) -> None:
         """Clear model cooldown on success."""

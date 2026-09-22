@@ -417,6 +417,8 @@ async def transform_openai_to_anthropic_sse_stream(
     buffer = ""
     has_tool_calls = False
 
+    has_error = False
+
     async for chunk in openai_stream.body_iterator:
         if isinstance(chunk, bytes):
             buffer += chunk.decode("utf-8", errors="replace")
@@ -436,6 +438,16 @@ async def transform_openai_to_anthropic_sse_stream(
                     continue
                 try:
                     payload = json.loads(data_str)
+                    if "error" in payload:
+                        err_obj = payload.get("error") or {}
+                        err_msg = (
+                            err_obj.get("message")
+                            if isinstance(err_obj, dict)
+                            else str(err_obj)
+                        )
+                        yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': err_msg}})}\n\n".encode()
+                        has_error = True
+                        break
                     choices = payload.get("choices", [])
                     if choices and isinstance(choices, list):
                         delta = choices[0].get("delta", {})
@@ -504,23 +516,24 @@ async def transform_openai_to_anthropic_sse_stream(
                 except Exception:
                     pass
 
-    # Stop all open content blocks
-    if text_block_started:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n".encode()
+    if not has_error:
+        # Stop all open content blocks
+        if text_block_started:
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n".encode()
 
-    for tc_info in active_tool_calls.values():
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tc_info['block_index']})}\n\n".encode()
+        for tc_info in active_tool_calls.values():
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tc_info['block_index']})}\n\n".encode()
 
-    stop_reason = "tool_use" if has_tool_calls else "end_turn"
-    msg_delta_event = {
-        "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": max(1, out_tokens)},
-    }
-    yield f"event: message_delta\ndata: {json.dumps(msg_delta_event)}\n\n".encode()
+        stop_reason = "tool_use" if has_tool_calls else "end_turn"
+        msg_delta_event = {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": max(1, out_tokens)},
+        }
+        yield f"event: message_delta\ndata: {json.dumps(msg_delta_event)}\n\n".encode()
 
-    msg_stop_event = {"type": "message_stop"}
-    yield f"event: message_stop\ndata: {json.dumps(msg_stop_event)}\n\n".encode()
+        msg_stop_event = {"type": "message_stop"}
+        yield f"event: message_stop\ndata: {json.dumps(msg_stop_event)}\n\n".encode()
 
 
 async def _handle_claude_or_chat(request: Request) -> JSONResponse | StreamingResponse:
@@ -528,6 +541,8 @@ async def _handle_claude_or_chat(request: Request) -> JSONResponse | StreamingRe
     path = request.url.path
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
         body = {}
 
@@ -541,12 +556,18 @@ async def _handle_claude_or_chat(request: Request) -> JSONResponse | StreamingRe
         if not openai_payload.get("model"):
             openai_payload["model"] = "potato/auto-coding"
 
+    body_sent = False
+
     async def _custom_receive():
-        return {
-            "type": "http.request",
-            "body": json.dumps(openai_payload).encode("utf-8"),
-            "more_body": False,
-        }
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {
+                "type": "http.request",
+                "body": json.dumps(openai_payload).encode("utf-8"),
+                "more_body": False,
+            }
+        return await request.receive()
 
     # Support x-api-key header for Claude Code CLI and Anthropic SDKs
     scope = dict(request.scope)

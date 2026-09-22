@@ -27,7 +27,10 @@ SpanCallback = Callable[["TraceSpan"], None]
 
 # D3: model-tier statuses cool only the model, never the provider transport
 # breaker. Everything else >= 400 that is retryable is transport-class.
-MODEL_TIER_STATUSES = frozenset({400, 401, 403, 404, 405, 408, 413, 422, 429, 503, 529})
+MODEL_TIER_STATUSES = frozenset({
+    400, 401, 403, 404, 405, 408, 413, 422, 429, 503,
+    520, 521, 522, 523, 524, 525, 526, 529, 530
+})
 
 
 @dataclass
@@ -139,13 +142,17 @@ def _is_model_not_found(status: int, body: Any) -> bool:
 
 
 def _is_retryable_model_error(status: int, body: Any) -> bool:
-    if status in {401, 403, 405, 408, 429, 500, 502, 503, 504}:
+    if status in {
+        401, 403, 405, 408, 429,
+        500, 502, 503, 504,
+        520, 521, 522, 523, 524, 525, 526, 529, 530
+    }:
         return True
     if _is_model_not_found(status, body):
         return True
     # Tools unsupported → try next model
-    if status == 400 and isinstance(body, dict):
-        msg = str((body.get("error") or {}).get("message") or "").lower()
+    if status == 400:
+        msg = _body_message(body).lower()
         if "tool" in msg and ("not support" in msg or "unsupported" in msg):
             return True
         # Providers that wrap server errors in 400 responses
@@ -165,7 +172,7 @@ def _is_retryable_model_error(status: int, body: Any) -> bool:
                 msg[:200],
             )
             return True
-    return status in {400, 413} and _is_context_overflow_message(_body_message(body))
+    return status in {400, 413, 422} and _is_context_overflow_message(_body_message(body))
 
 
 def _body_message(body: Any) -> str:
@@ -1573,7 +1580,7 @@ class FallbackExecutor:
             if fit or unknown:
                 # Auto: keep overflow models at the very tail (provider may still accept)
                 available = fit + unknown + (overflow if is_auto else [])
-            elif is_auto and overflow:
+            elif overflow:
                 # Only overflow known — still try rather than 503
                 available = overflow
         # Hard routing constraints (allowed_models / free-only) must hold for
@@ -1796,6 +1803,7 @@ class FallbackExecutor:
                     body_size // 1024,
                     len(attempt_body.get("messages") or []),
                 )
+            key = None
             try:
                 import asyncio as _aio
 
@@ -2494,6 +2502,7 @@ class FallbackExecutor:
                 default_effort=getattr(self.settings, "default_reasoning_effort", ""),
             )
             t_attempt = time.perf_counter()
+            key = None
             try:
                 import asyncio as _aio
 
@@ -3165,8 +3174,12 @@ class FallbackExecutor:
                     status=status,
                 )
 
-            retryable = status in {401, 403, 404, 405, 408, 429, 500, 502, 503, 504} or (
-                status == 400 and _is_retryable_model_error(status, err_body)
+            retryable = status in {
+                401, 403, 404, 405, 408, 429,
+                500, 502, 503, 504,
+                520, 521, 522, 523, 524, 525, 526, 529, 530
+            } or (
+                status in {400, 413, 422} and _is_retryable_model_error(status, err_body)
             )
             self._record_outcome(
                 decision,

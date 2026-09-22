@@ -427,6 +427,22 @@ async def transform_chat_sse_to_responses_sse(
             except Exception:
                 continue
 
+            if "error" in payload:
+                err_obj = payload.get("error") or {}
+                err_msg = err_obj.get("message") if isinstance(err_obj, dict) else str(err_obj)
+                yield frame(
+                    "response.failed",
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": rid,
+                            "status": "failed",
+                            "error": {"code": "upstream_error", "message": err_msg},
+                        },
+                    },
+                )
+                return
+
             choices = payload.get("choices") or []
             if not choices:
                 continue
@@ -493,6 +509,22 @@ async def transform_chat_sse_to_responses_sse(
                     )
 
             finish = choice.get("finish_reason")
+            if finish == "error":
+                yield frame(
+                    "response.failed",
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": rid,
+                            "status": "failed",
+                            "error": {
+                                "code": "upstream_stream_error",
+                                "message": "Upstream stream terminated with error",
+                            },
+                        },
+                    },
+                )
+                return
             if finish:
                 # Finalize any in-flight tool calls.
                 for tc_id, fc_item in tool_items.items():
@@ -587,6 +619,8 @@ async def _handle_responses(request: Request) -> JSONResponse | StreamingRespons
     """Translate /v1/responses → /chat/completions upstream, translate back."""
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
     except Exception:
         body = {}
 
@@ -597,12 +631,18 @@ async def _handle_responses(request: Request) -> JSONResponse | StreamingRespons
     # Preserve stream flag for the upstream chat call.
     chat_body["stream"] = is_stream
 
+    body_sent = False
+
     async def _custom_receive():
-        return {
-            "type": "http.request",
-            "body": json.dumps(chat_body).encode("utf-8"),
-            "more_body": False,
-        }
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {
+                "type": "http.request",
+                "body": json.dumps(chat_body).encode("utf-8"),
+                "more_body": False,
+            }
+        return await request.receive()
 
     # x-api-key → Authorization (Anthropic SDK / some OpenAI SDK configs).
     scope = dict(request.scope)

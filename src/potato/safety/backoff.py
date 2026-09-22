@@ -25,7 +25,9 @@ def compute_backoff_seconds(
     exp = min(cap, base * (2 ** max(0, attempt)))
     delay = exp
     if retry_after is not None and retry_after > 0:
-        delay = max(delay, float(retry_after))
+        # Enforce sanity ceiling so rogue/malicious Retry-After headers (e.g. 86400s) cannot freeze the task
+        effective_retry_after = min(float(retry_after), max_delay if max_delay is not None else max(cap, 60.0))
+        delay = max(delay, effective_retry_after)
     delay *= 1.0 + random.uniform(0.0, 0.2)
     if max_delay is not None:
         delay = min(delay, max(0.0, max_delay))
